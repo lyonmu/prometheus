@@ -58,6 +58,7 @@ import (
 	klogv2 "k8s.io/klog/v2"
 
 	"github.com/prometheus/prometheus/config"
+	"github.com/prometheus/prometheus/consul"
 	"github.com/prometheus/prometheus/discovery"
 	"github.com/prometheus/prometheus/model/exemplar"
 	"github.com/prometheus/prometheus/model/histogram"
@@ -216,6 +217,8 @@ type flagConfig struct {
 	promqlEnableDelayedNameRemoval bool
 
 	promslogConfig promslog.Config
+
+	consul consul.Options
 }
 
 // setFeatureListOptions sets the corresponding options from the featureList.
@@ -349,6 +352,7 @@ func main() {
 			Gatherer:   prometheus.DefaultGatherer,
 		},
 		promslogConfig: promslog.Config{},
+		consul:         consul.Options{},
 	}
 
 	a := kingpin.New(filepath.Base(os.Args[0]), "The Prometheus monitoring server").UsageWriter(os.Stdout)
@@ -356,6 +360,11 @@ func main() {
 	a.Version(version.Print(appName))
 
 	a.HelpFlag.Short('h')
+
+	a.Flag("consul.url", "Consul URL.").Default("http://127.0.0.1:8500").StringVar(&cfg.consul.Url)
+	a.Flag("consul.token", "Consul token.").Default("").StringVar(&cfg.consul.Token)
+	a.Flag("consul.health-check-url", "Consul health check URL.").Default("http://127.0.0.1:9090/-/healthy").StringVar(&cfg.consul.HealthCheckUrl)
+	a.Flag("consul.enable", "Enable Consul.").Default("false").BoolVar(&cfg.consul.Enable)
 
 	a.Flag("config.file", "Prometheus configuration file path.").
 		Default("prometheus.yml").StringVar(&cfg.configFile)
@@ -1403,6 +1412,11 @@ func main() {
 			},
 		)
 	}
+
+	if cfg.consul.Enable {
+		consul.New(logger.With("component", "consul"), &cfg.consul)
+	}
+
 	{
 		// Web handler.
 		g.Add(
