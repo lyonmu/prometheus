@@ -15,9 +15,9 @@ import (
 var (
 	serviceName          = "prometheus"
 	consulClient         *capi.Client
-	checkInterval        = "10s"
-	checkTimeout         = "5s"
-	checkDeregisterAfter = "10s"
+	checkInterval        = "60s"
+	checkTimeout         = "10s"
+	checkDeregisterAfter = "30s"
 )
 
 type Options struct {
@@ -92,8 +92,6 @@ func New(logger *slog.Logger, o *Options) {
 			"start_time": time.Now().Format(time.DateTime),
 		},
 	}
-
-	logger.Info("=============%+v============", reg)
 
 	err = consulClient.Agent().ServiceRegister(reg)
 	if err != nil {
