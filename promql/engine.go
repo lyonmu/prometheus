@@ -1,4 +1,4 @@
-// Copyright 2013 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -49,6 +49,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/features"
 	"github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/stats"
 	"github.com/prometheus/prometheus/util/zeropool"
@@ -76,15 +77,19 @@ const (
 )
 
 type engineMetrics struct {
-	currentQueries       prometheus.Gauge
-	maxConcurrentQueries prometheus.Gauge
-	queryLogEnabled      prometheus.Gauge
-	queryLogFailures     prometheus.Counter
-	queryQueueTime       prometheus.Observer
-	queryPrepareTime     prometheus.Observer
-	queryInnerEval       prometheus.Observer
-	queryResultSort      prometheus.Observer
-	querySamples         prometheus.Counter
+	currentQueries            prometheus.Gauge
+	maxConcurrentQueries      prometheus.Gauge
+	queryLogEnabled           prometheus.Gauge
+	queryLogFailures          prometheus.Counter
+	queryQueueTime            prometheus.Observer
+	queryQueueTimeHistogram   prometheus.Observer
+	queryPrepareTime          prometheus.Observer
+	queryPrepareTimeHistogram prometheus.Observer
+	queryInnerEval            prometheus.Observer
+	queryInnerEvalHistogram   prometheus.Observer
+	queryResultSort           prometheus.Observer
+	queryResultSortHistogram  prometheus.Observer
+	querySamples              prometheus.Counter
 }
 
 type (
@@ -326,6 +331,9 @@ type EngineOpts struct {
 	EnableDelayedNameRemoval bool
 	// EnableTypeAndUnitLabels will allow PromQL Engine to make decisions based on the type and unit labels.
 	EnableTypeAndUnitLabels bool
+
+	// FeatureRegistry is the registry for tracking enabled/disabled features.
+	FeatureRegistry features.Collector
 }
 
 // Engine handles the lifetime of queries from beginning to end.
@@ -363,6 +371,19 @@ func NewEngine(opts EngineOpts) *Engine {
 		[]string{"slice"},
 	)
 
+	queryResultHistogram := prometheus.NewHistogramVec(prometheus.HistogramOpts{
+		Namespace:                       namespace,
+		Subsystem:                       subsystem,
+		Name:                            "query_duration_histogram_seconds",
+		Help:                            "The duration of various parts of PromQL query execution.",
+		Buckets:                         []float64{.01, .1, 1, 10},
+		NativeHistogramBucketFactor:     1.1,
+		NativeHistogramMaxBucketNumber:  100,
+		NativeHistogramMinResetDuration: 1 * time.Hour,
+	},
+		[]string{"slice"},
+	)
+
 	metrics := &engineMetrics{
 		currentQueries: prometheus.NewGauge(prometheus.GaugeOpts{
 			Namespace: namespace,
@@ -394,10 +415,14 @@ func NewEngine(opts EngineOpts) *Engine {
 			Name:      "query_samples_total",
 			Help:      "The total number of samples loaded by all queries.",
 		}),
-		queryQueueTime:   queryResultSummary.WithLabelValues("queue_time"),
-		queryPrepareTime: queryResultSummary.WithLabelValues("prepare_time"),
-		queryInnerEval:   queryResultSummary.WithLabelValues("inner_eval"),
-		queryResultSort:  queryResultSummary.WithLabelValues("result_sort"),
+		queryQueueTime:            queryResultSummary.WithLabelValues("queue_time"),
+		queryQueueTimeHistogram:   queryResultHistogram.WithLabelValues("queue_time"),
+		queryPrepareTime:          queryResultSummary.WithLabelValues("prepare_time"),
+		queryPrepareTimeHistogram: queryResultHistogram.WithLabelValues("prepare_time"),
+		queryInnerEval:            queryResultSummary.WithLabelValues("inner_eval"),
+		queryInnerEvalHistogram:   queryResultHistogram.WithLabelValues("inner_eval"),
+		queryResultSort:           queryResultSummary.WithLabelValues("result_sort"),
+		queryResultSortHistogram:  queryResultHistogram.WithLabelValues("result_sort"),
 	}
 
 	if t := opts.ActiveQueryTracker; t != nil {
@@ -421,7 +446,20 @@ func NewEngine(opts EngineOpts) *Engine {
 			metrics.queryLogFailures,
 			metrics.querySamples,
 			queryResultSummary,
+			queryResultHistogram,
 		)
+	}
+
+	if r := opts.FeatureRegistry; r != nil {
+		r.Set(features.PromQL, "at_modifier", opts.EnableAtModifier)
+		r.Set(features.PromQL, "negative_offset", opts.EnableNegativeOffset)
+		r.Set(features.PromQL, "per_step_stats", opts.EnablePerStepStats)
+		r.Set(features.PromQL, "delayed_name_removal", opts.EnableDelayedNameRemoval)
+		r.Set(features.PromQL, "type_and_unit_labels", opts.EnableTypeAndUnitLabels)
+		r.Enable(features.PromQL, "per_query_lookback_delta")
+		r.Enable(features.PromQL, "subqueries")
+
+		parser.RegisterFeatures(r)
 	}
 
 	return &Engine{
@@ -701,7 +739,7 @@ func (ng *Engine) queueActive(ctx context.Context, q *query) (func(), error) {
 	if ng.activeQueryTracker == nil {
 		return func() {}, nil
 	}
-	queueSpanTimer, _ := q.stats.GetSpanTimer(ctx, stats.ExecQueueTime, ng.metrics.queryQueueTime)
+	queueSpanTimer, _ := q.stats.GetSpanTimer(ctx, stats.ExecQueueTime, ng.metrics.queryQueueTime, ng.metrics.queryQueueTimeHistogram)
 	queryIndex, err := ng.activeQueryTracker.Insert(ctx, q.q)
 	queueSpanTimer.Finish()
 	return func() { ng.activeQueryTracker.Delete(queryIndex) }, err
@@ -717,7 +755,7 @@ func durationMilliseconds(d time.Duration) int64 {
 
 // execEvalStmt evaluates the expression of an evaluation statement for the given time range.
 func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.EvalStmt) (parser.Value, annotations.Annotations, error) {
-	prepareSpanTimer, ctxPrepare := query.stats.GetSpanTimer(ctx, stats.QueryPreparationTime, ng.metrics.queryPrepareTime)
+	prepareSpanTimer, ctxPrepare := query.stats.GetSpanTimer(ctx, stats.QueryPreparationTime, ng.metrics.queryPrepareTime, ng.metrics.queryPrepareTimeHistogram)
 	mint, maxt := FindMinMaxTime(s)
 	querier, err := query.queryable.Querier(mint, maxt)
 	if err != nil {
@@ -732,7 +770,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 	// Modify the offset of vector and matrix selectors for the @ modifier
 	// w.r.t. the start time since only 1 evaluation will be done on them.
 	setOffsetForAtModifier(timeMilliseconds(s.Start), s.Expr)
-	evalSpanTimer, ctxInnerEval := query.stats.GetSpanTimer(ctx, stats.InnerEvalTime, ng.metrics.queryInnerEval)
+	evalSpanTimer, ctxInnerEval := query.stats.GetSpanTimer(ctx, stats.InnerEvalTime, ng.metrics.queryInnerEval, ng.metrics.queryInnerEvalHistogram)
 	// Instant evaluation. This is executed as a range evaluation with one step.
 	if s.Start.Equal(s.End) && s.Interval == 0 {
 		start := timeMilliseconds(s.Start)
@@ -835,7 +873,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 }
 
 func (ng *Engine) sortMatrixResult(ctx context.Context, query *query, mat Matrix) {
-	sortSpanTimer, _ := query.stats.GetSpanTimer(ctx, stats.ResultSortTime, ng.metrics.queryResultSort)
+	sortSpanTimer, _ := query.stats.GetSpanTimer(ctx, stats.ResultSortTime, ng.metrics.queryResultSort, ng.metrics.queryResultSortHistogram)
 	sort.Sort(mat)
 	sortSpanTimer.Finish()
 }
@@ -1137,7 +1175,7 @@ func (ev *evaluator) Eval(ctx context.Context, expr parser.Expr) (v parser.Value
 
 	v, ws = ev.eval(ctx, expr)
 	if ev.enableDelayedNameRemoval {
-		ev.cleanupMetricLabels(v)
+		v = ev.cleanupMetricLabels(v)
 	}
 	return v, ws, nil
 }
@@ -1259,7 +1297,7 @@ func (enh *EvalNodeHelper) resetHistograms(inVec Vector, arg parser.Expr) annota
 // the given funcCall with the values computed for each expression at that
 // step. The return value is the combination into time series of all the
 // function call results.
-// The prepSeries function (if provided) can be used to prepare the helper
+// The matching (if provided) can be used to prepare the helper
 // for each series, then passed to each call funcCall.
 func (ev *evaluator) rangeEval(ctx context.Context, matching *parser.VectorMatching, funcCall func([]Vector, Matrix, [][]EvalSeriesHelper, *EvalNodeHelper) (Vector, annotations.Annotations), exprs ...parser.Expr) (Matrix, annotations.Annotations) {
 	numSteps := int((ev.endTimestamp-ev.startTimestamp)/ev.interval) + 1
@@ -2153,8 +2191,8 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 					mat[i].Histograms[j].H = mat[i].Histograms[j].H.Copy().Mul(-1)
 				}
 			}
-			if !ev.enableDelayedNameRemoval && mat.ContainsSameLabelset() {
-				ev.errorf("vector cannot contain metrics with the same labelset")
+			if !ev.enableDelayedNameRemoval {
+				mat = ev.mergeSeriesWithSameLabelset(mat)
 			}
 		}
 		return mat, ws
@@ -2824,7 +2862,8 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 	if matching.Card == parser.CardManyToMany {
 		panic("many-to-many only allowed for set operators")
 	}
-	if len(lhs) == 0 || len(rhs) == 0 {
+	if (len(lhs) == 0 && len(rhs) == 0) ||
+		((len(lhs) == 0 || len(rhs) == 0) && matching.FillValues.RHS == nil && matching.FillValues.LHS == nil) {
 		return nil, nil // Short-circuit: nothing is going to match.
 	}
 
@@ -2872,17 +2911,9 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 	}
 	matchedSigs := enh.matchedSigs
 
-	// For all lhs samples find a respective rhs sample and perform
-	// the binary operation.
 	var lastErr error
-	for i, ls := range lhs {
-		sigOrd := lhsh[i].sigOrdinal
 
-		rs, found := rightSigs[sigOrd] // Look for a match in the rhs Vector.
-		if !found {
-			continue
-		}
-
+	doBinOp := func(ls, rs Sample, sigOrd int) {
 		// Account for potentially swapped sidedness.
 		fl, fr := ls.F, rs.F
 		hl, hr := ls.H, rs.H
@@ -2893,22 +2924,20 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 		floatValue, histogramValue, keep, info, err := vectorElemBinop(op, fl, fr, hl, hr, pos)
 		if err != nil {
 			lastErr = err
-			continue
+			return
 		}
 		if info != nil {
 			lastErr = info
 		}
-		switch {
-		case returnBool:
+		if returnBool {
 			histogramValue = nil
 			if keep {
 				floatValue = 1.0
 			} else {
 				floatValue = 0.0
 			}
-		case !keep:
-			continue
 		}
+
 		metric := resultMetric(ls.Metric, rs.Metric, op, matching, enh)
 		if !ev.enableDelayedNameRemoval && returnBool {
 			metric = metric.DropReserved(schema.IsMetadataLabel)
@@ -2934,6 +2963,10 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 			insertedSigs[insertSig] = struct{}{}
 		}
 
+		if !keep && !returnBool {
+			return
+		}
+
 		enh.Out = append(enh.Out, Sample{
 			Metric:   metric,
 			F:        floatValue,
@@ -2941,6 +2974,43 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 			DropName: returnBool,
 		})
 	}
+
+	// For all lhs samples, find a respective rhs sample and perform
+	// the binary operation.
+	for i, ls := range lhs {
+		sigOrd := lhsh[i].sigOrdinal
+
+		rs, found := rightSigs[sigOrd] // Look for a match in the rhs Vector.
+		if !found {
+			fill := matching.FillValues.RHS
+			if fill == nil {
+				continue
+			}
+			rs = Sample{
+				Metric: ls.Metric.MatchLabels(matching.On, matching.MatchingLabels...),
+				F:      *fill,
+			}
+		}
+
+		doBinOp(ls, rs, sigOrd)
+	}
+
+	// For any rhs samples which have not been matched, check if we need to
+	// perform the operation with a fill value from the lhs.
+	if fill := matching.FillValues.LHS; fill != nil {
+		for sigOrd, rs := range rightSigs {
+			if _, matched := matchedSigs[sigOrd]; matched {
+				continue // Already matched.
+			}
+			ls := Sample{
+				Metric: rs.Metric.MatchLabels(matching.On, matching.MatchingLabels...),
+				F:      *fill,
+			}
+
+			doBinOp(ls, rs, sigOrd)
+		}
+	}
+
 	return enh.Out, lastErr
 }
 
@@ -3792,7 +3862,7 @@ func (*evaluator) aggregationCountValues(e *parser.AggregateExpr, grouping []str
 	return enh.Out, nil
 }
 
-func (ev *evaluator) cleanupMetricLabels(v parser.Value) {
+func (ev *evaluator) cleanupMetricLabels(v parser.Value) parser.Value {
 	if v.Type() == parser.ValueTypeMatrix {
 		mat := v.(Matrix)
 		for i := range mat {
@@ -3800,9 +3870,7 @@ func (ev *evaluator) cleanupMetricLabels(v parser.Value) {
 				mat[i].Metric = mat[i].Metric.DropReserved(schema.IsMetadataLabel)
 			}
 		}
-		if mat.ContainsSameLabelset() {
-			ev.errorf("vector cannot contain metrics with the same labelset")
-		}
+		return ev.mergeSeriesWithSameLabelset(mat)
 	} else if v.Type() == parser.ValueTypeVector {
 		vec := v.(Vector)
 		for i := range vec {
@@ -3813,7 +3881,75 @@ func (ev *evaluator) cleanupMetricLabels(v parser.Value) {
 		if vec.ContainsSameLabelset() {
 			ev.errorf("vector cannot contain metrics with the same labelset")
 		}
+		return vec
 	}
+	return v
+}
+
+// mergeSeriesWithSameLabelset merges series in a matrix that have the same labelset
+// after __name__ label removal. This happens when delayed name removal is enabled and
+// operations like OR combine series that originally had different names but end up
+// with the same labelset after dropping the name. If series with the same labelset
+// have overlapping timestamps, an error is returned.
+func (ev *evaluator) mergeSeriesWithSameLabelset(mat Matrix) Matrix {
+	if len(mat) <= 1 {
+		return mat
+	}
+
+	// Fast path: check if there are any duplicate labelsets without allocating.
+	// This is the common case and we want to avoid allocations.
+	if !mat.ContainsSameLabelset() {
+		return mat
+	}
+
+	// Slow path: there are duplicates, so we need to merge series with non-overlapping timestamps.
+	// Group series by their labelset hash.
+	seriesByHash := make(map[uint64][]int)
+	for i := range mat {
+		hash := mat[i].Metric.Hash()
+		seriesByHash[hash] = append(seriesByHash[hash], i)
+	}
+
+	// Merge series with the same labelset.
+	merged := make(Matrix, 0, len(seriesByHash))
+	for _, indices := range seriesByHash {
+		if len(indices) == 1 {
+			// No collision, add as-is.
+			merged = append(merged, mat[indices[0]])
+			continue
+		}
+
+		// Multiple series with the same labelset - merge all samples.
+		base := mat[indices[0]]
+		for _, idx := range indices[1:] {
+			base.Floats = append(base.Floats, mat[idx].Floats...)
+			base.Histograms = append(base.Histograms, mat[idx].Histograms...)
+		}
+
+		// Sort merged samples by timestamp.
+		sort.Slice(base.Floats, func(i, j int) bool {
+			return base.Floats[i].T < base.Floats[j].T
+		})
+		sort.Slice(base.Histograms, func(i, j int) bool {
+			return base.Histograms[i].T < base.Histograms[j].T
+		})
+
+		// Check for duplicate timestamps in sorted samples.
+		for i := 1; i < len(base.Floats); i++ {
+			if base.Floats[i].T == base.Floats[i-1].T {
+				ev.errorf("vector cannot contain metrics with the same labelset")
+			}
+		}
+		for i := 1; i < len(base.Histograms); i++ {
+			if base.Histograms[i].T == base.Histograms[i-1].T {
+				ev.errorf("vector cannot contain metrics with the same labelset")
+			}
+		}
+
+		merged = append(merged, base)
+	}
+
+	return merged
 }
 
 func addToSeries(ss *Series, ts int64, f float64, h *histogram.FloatHistogram, numSteps int) {
@@ -3951,7 +4087,7 @@ func unwrapStepInvariantExpr(e parser.Expr) parser.Expr {
 func PreprocessExpr(expr parser.Expr, start, end time.Time, step time.Duration) (parser.Expr, error) {
 	detectHistogramStatsDecoding(expr)
 
-	if err := parser.Walk(&durationVisitor{step: step}, expr, nil); err != nil {
+	if err := parser.Walk(&durationVisitor{step: step, queryRange: end.Sub(start)}, expr, nil); err != nil {
 		return nil, err
 	}
 
@@ -4312,9 +4448,9 @@ func extendFloats(floats []FPoint, mint, maxt int64, smoothed bool) []FPoint {
 		lastSampleIndex--
 	}
 
-	// TODO: Preallocate the length of the new list.
-	out := make([]FPoint, 0)
-	// Create the new floats list with the boundary samples and the inner samples.
+	count := max(lastSampleIndex-firstSampleIndex+1, 0)
+	out := make([]FPoint, 0, count+2)
+
 	out = append(out, FPoint{T: mint, F: left})
 	out = append(out, floats[firstSampleIndex:lastSampleIndex+1]...)
 	out = append(out, FPoint{T: maxt, F: right})

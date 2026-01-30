@@ -1,4 +1,4 @@
-// Copyright 2016 The Prometheus Authors
+// Copyright The Prometheus Authors
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
 // You may obtain a copy of the License at
@@ -56,6 +56,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/util/annotations"
+	"github.com/prometheus/prometheus/util/features"
 	"github.com/prometheus/prometheus/util/httputil"
 	"github.com/prometheus/prometheus/util/notifications"
 	"github.com/prometheus/prometheus/util/stats"
@@ -255,6 +256,9 @@ type API struct {
 	otlpWriteHandler   http.Handler
 
 	codecs []Codec
+
+	featureRegistry features.Collector
+	openAPIBuilder  *OpenAPIBuilder
 }
 
 // NewAPI returns an initialized API type.
@@ -295,6 +299,8 @@ func NewAPI(
 	enableTypeAndUnitLabels bool,
 	appendMetadata bool,
 	overrideErrorCode OverrideErrorCode,
+	featureRegistry features.Collector,
+	openAPIOptions OpenAPIOptions,
 ) *API {
 	a := &API{
 		QueryEngine:       qe,
@@ -324,6 +330,8 @@ func NewAPI(
 		notificationsGetter: notificationsGetter,
 		notificationsSub:    notificationsSub,
 		overrideErrorCode:   overrideErrorCode,
+		featureRegistry:     featureRegistry,
+		openAPIBuilder:      NewOpenAPIBuilder(openAPIOptions, logger),
 
 		remoteReadHandler: remote.NewReadHandler(logger, registerer, q, configFunc, remoteReadSampleLimit, remoteReadConcurrencyLimit, remoteReadMaxBytesInFrame),
 	}
@@ -395,7 +403,7 @@ func (api *API) Register(r *route.Router) {
 			w.WriteHeader(http.StatusNoContent)
 		})
 		return api.ready(httputil.CompressionHandler{
-			Handler: hf,
+			Handler: api.openAPIBuilder.WrapHandler(hf),
 		}.ServeHTTP)
 	}
 
@@ -445,6 +453,7 @@ func (api *API) Register(r *route.Router) {
 	r.Get("/status/flags", wrap(api.serveFlags))
 	r.Get("/status/tsdb", wrapAgent(api.serveTSDBStatus))
 	r.Get("/status/tsdb/blocks", wrapAgent(api.serveTSDBBlocks))
+	r.Get("/features", wrap(api.features))
 	r.Get("/status/walreplay", api.serveWALReplayStatus)
 	r.Get("/notifications", api.notifications)
 	r.Get("/notifications/live", api.notificationsSSE)
@@ -463,6 +472,9 @@ func (api *API) Register(r *route.Router) {
 	r.Put("/admin/tsdb/delete_series", wrapAgent(api.deleteSeries))
 	r.Put("/admin/tsdb/clean_tombstones", wrapAgent(api.cleanTombstones))
 	r.Put("/admin/tsdb/snapshot", wrapAgent(api.snapshot))
+
+	// OpenAPI endpoint.
+	r.Get("/openapi.yaml", api.ready(api.openAPIBuilder.ServeOpenAPI))
 }
 
 type QueryData struct {
@@ -1340,13 +1352,19 @@ func (api *API) targetRelabelSteps(r *http.Request) apiFuncResult {
 
 	rules := scrapeConfig.RelabelConfigs
 	steps := make([]RelabelStep, len(rules))
+	lb := labels.NewBuilder(lbls)
+	keep := true
 	for i, rule := range rules {
-		outLabels, keep := relabel.Process(lbls, rules[:i+1]...)
-		steps[i] = RelabelStep{
-			Rule:   rule,
-			Output: outLabels,
-			Keep:   keep,
+		if keep {
+			keep = relabel.ProcessBuilder(lb, rule)
 		}
+
+		outLabels := labels.EmptyLabels()
+		if keep {
+			outLabels = lb.Labels()
+		}
+
+		steps[i] = RelabelStep{Rule: rule, Output: outLabels, Keep: keep}
 	}
 
 	return apiFuncResult{&RelabelStepsResponse{Steps: steps}, nil, nil, nil}
@@ -1789,6 +1807,29 @@ func (api *API) serveFlags(*http.Request) apiFuncResult {
 	return apiFuncResult{api.flagsMap, nil, nil, nil}
 }
 
+// featuresData wraps feature flags data to provide custom JSON marshaling without HTML escaping.
+// featuresData does not contain user-provided input, and it is more convenient to have unescaped
+// representation of PromQL operators like >=.
+type featuresData struct {
+	data map[string]map[string]bool
+}
+
+func (f featuresData) MarshalJSON() ([]byte, error) {
+	json := jsoniter.Config{
+		EscapeHTML:             false,
+		SortMapKeys:            true,
+		ValidateJsonRawMessage: true,
+	}.Froze()
+	return json.Marshal(f.data)
+}
+
+func (api *API) features(*http.Request) apiFuncResult {
+	if api.featureRegistry == nil {
+		return apiFuncResult{nil, &apiError{errorInternal, errors.New("feature registry not configured")}, nil, nil}
+	}
+	return apiFuncResult{featuresData{data: api.featureRegistry.Get()}, nil, nil, nil}
+}
+
 // TSDBStat holds the information about individual cardinality.
 type TSDBStat struct {
 	Name  string `json:"name"`
@@ -1837,11 +1878,15 @@ func (api *API) serveTSDBBlocks(*http.Request) apiFuncResult {
 }
 
 func (api *API) serveTSDBStatus(r *http.Request) apiFuncResult {
+	const maxTSDBLimit = 10000
 	limit := 10
 	if s := r.FormValue("limit"); s != "" {
 		var err error
 		if limit, err = strconv.Atoi(s); err != nil || limit < 1 {
 			return apiFuncResult{nil, &apiError{errorBadData, errors.New("limit must be a positive number")}, nil, nil}
+		}
+		if limit > maxTSDBLimit {
+			return apiFuncResult{nil, &apiError{errorBadData, fmt.Errorf("limit must not exceed %d", maxTSDBLimit)}, nil, nil}
 		}
 	}
 	s, err := api.db.Stats(labels.MetricName, limit)
