@@ -1,7 +1,6 @@
 package consul
 
 import (
-	"fmt"
 	"net/url"
 	"strconv"
 	"time"
@@ -79,8 +78,8 @@ func New(logger *slog.Logger, o *Options) {
 	reg := &capi.AgentServiceRegistration{
 		Name:    serviceName,
 		Port:    port,
-		Address: host,
-		ID:      fmt.Sprintf("%s:%d", host, port),
+		Address: host[:len(host)-len(":"+strconv.Itoa(port))],
+		ID:      host,
 		Check: &capi.AgentServiceCheck{
 			HTTP:                           o.HealthCheckUrl,
 			Interval:                       checkInterval,
@@ -93,6 +92,9 @@ func New(logger *slog.Logger, o *Options) {
 			"start_time": time.Now().Format(time.DateTime),
 		},
 	}
+
+	logger.Info("=============%+v============", reg)
+
 	err = consulClient.Agent().ServiceRegister(reg)
 	if err != nil {
 		logger.Error("register service to consul", "error", err)
