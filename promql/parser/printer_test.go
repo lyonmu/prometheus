@@ -22,11 +22,10 @@ import (
 )
 
 func TestExprString(t *testing.T) {
-	ExperimentalDurationExpr = true
-	EnableBinopFillModifiers = true
-	t.Cleanup(func() {
-		ExperimentalDurationExpr = false
-		EnableBinopFillModifiers = false
+	optsParser := NewParser(Options{
+		ExperimentalDurationExpr:     true,
+		EnableExtendedRangeSelectors: true,
+		EnableBinopFillModifiers:     true,
 	})
 	// A list of valid expressions that are expected to be
 	// returned as out when calling String(). If out is empty the output
@@ -130,6 +129,10 @@ func TestExprString(t *testing.T) {
 		{
 			in:  `a + fill_left(-23) fill_right(42) b`,
 			out: `a + fill_left (-23) fill_right (42) b`,
+		},
+		{
+			in:  `a + fill_left(5) fill_right(5) b`,
+			out: `a + fill (5) b`,
 		},
 		{
 			in:  `a + on(b) group_left fill(-23) c`,
@@ -271,22 +274,22 @@ func TestExprString(t *testing.T) {
 			out: "foo offset (5 * 2)",
 		},
 		{
-			in:  "foo offset +min(10s, 20s)",
-			out: "foo offset min(10s, 20s)",
+			in:  "foo offset +min_of(10s, 20s)",
+			out: "foo offset min_of(10s, 20s)",
 		},
 		{
-			in: "foo offset -min(10s, 20s)",
+			in: "foo offset -min_of(10s, 20s)",
 		},
 		{
-			in:  "foo offset -min(10s, +max(step() ^ 2, 2))",
-			out: "foo offset -min(10s, max(step() ^ 2, 2))",
+			in:  "foo offset -min_of(10s, +max_of(step() ^ 2, 2))",
+			out: "foo offset -min_of(10s, max_of(step() ^ 2, 2))",
 		},
 		{
-			in:  "foo[200-min(-step()^+step(),1)]",
-			out: "foo[200 - min(-step() ^ step(), 1)]",
+			in:  "foo[200-min_of(-step()^+step(),1)]",
+			out: "foo[200 - min_of(-step() ^ step(), 1)]",
 		},
 		{
-			in: "foo[200 - min(step() + 10s, -max(step() ^ 2, 3))]",
+			in: "foo[200 - min_of(step() + 10s, -max_of(step() ^ 2, 3))]",
 		},
 		{
 			in: "foo[range()]",
@@ -301,7 +304,7 @@ func TestExprString(t *testing.T) {
 			in: "foo offset -range()",
 		},
 		{
-			in: "foo[max(range(), 5s)]",
+			in: "foo[max_of(range(), 5s)]",
 		},
 		{
 			in: `predict_linear(foo[1h], 3000)`,
@@ -320,14 +323,9 @@ func TestExprString(t *testing.T) {
 		},
 	}
 
-	EnableExtendedRangeSelectors = true
-	t.Cleanup(func() {
-		EnableExtendedRangeSelectors = false
-	})
-
 	for _, test := range inputs {
 		t.Run(test.in, func(t *testing.T) {
-			expr, err := ParseExpr(test.in)
+			expr, err := optsParser.ParseExpr(test.in)
 			require.NoError(t, err)
 
 			exp := test.in
@@ -352,7 +350,7 @@ func BenchmarkExprString(b *testing.B) {
 
 	for _, test := range inputs {
 		b.Run(readable(test), func(b *testing.B) {
-			expr, err := ParseExpr(test)
+			expr, err := testParser.ParseExpr(test)
 			require.NoError(b, err)
 			for b.Loop() {
 				_ = expr.String()
@@ -484,7 +482,7 @@ func TestBinaryExprUTF8Labels(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			expr, err := ParseExpr(tc.input)
+			expr, err := testParser.ParseExpr(tc.input)
 			if err != nil {
 				t.Fatalf("Failed to parse: %v", err)
 			}

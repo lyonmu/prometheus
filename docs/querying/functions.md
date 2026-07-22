@@ -173,6 +173,16 @@ entirely. For elements that contain a mix of float and histogram samples, only
 the float samples are used as input, which is flagged by an info-level
 annotation.
 
+## `end()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`end()` returns the end timestamp of the current query range evaluation as the
+number of seconds since January 1, 1970 UTC. For instant queries, this is equal
+to the evaluation timestamp.
+
 ## `double_exponential_smoothing()`
 
 **This function has to be enabled via the [feature
@@ -219,7 +229,7 @@ to their original value. Histogram samples in the input vector are ignored silen
 ## `histogram_avg()`
 
 `histogram_avg(v instant-vector)` returns the arithmetic average of observed
-values stored in each histogram sample in `v`. Float samples are ignored and do
+values stored in each native histogram sample in `v`. Float samples are ignored and do
 not show up in the returned vector.
 
 Use `histogram_avg` as demonstrated below to compute the average request duration
@@ -236,11 +246,11 @@ Which is equivalent to the following query:
 ## `histogram_count()` and `histogram_sum()`
 
 `histogram_count(v instant-vector)` returns the count of observations stored in
-each histogram sample in `v`. Float samples are ignored and do not show up in
+each native histogram sample in `v`. Float samples are ignored and do not show up in
 the returned vector.
 
 Similarly, `histogram_sum(v instant-vector)` returns the sum of observations
-stored in each histogram sample.
+stored in each native histogram sample.
 
 Use `histogram_count` in the following way to calculate a rate of observations
 (in this case corresponding to “requests per second”) from a series of
@@ -433,17 +443,34 @@ and is therefore flagged by an info-level annotation reading `input to
 histogram_quantile needed to be fixed for monotonicity`. If you encounter this
 annotation, you should find and remove the source of the invalid data.
 
+## `histogram_quantiles()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`histogram_quantiles(v instant-vector, quantile_label string, φ_1 scalar, φ_2 scalar, ...)` calculates multiple (between 1 and 10) φ-quantiles (0 ≤
+φ ≤ 1) from a [classic
+histogram](https://prometheus.io/docs/concepts/metric_types/#histogram) or from
+a native histogram. Quantile calculation works the same way as in `histogram_quantile()`.
+The second argument (a string) specifies the label name that is used to identify different quantiles in the query result.
+```
+histogram_quantiles(sum(rate(foo[1m])), "quantile", 0.9, 0.99)
+# => {quantile="0.9"} 123
+     {quantile="0.99"} 128
+```
+
 ## `histogram_stddev()` and `histogram_stdvar()`
 
 `histogram_stddev(v instant-vector)` returns the estimated standard deviation
-of observations for each histogram sample in `v`. For this estimation, all observations
+of observations for each native histogram sample in `v`. For this estimation, all observations
 in a bucket are assumed to have the value of the mean of the bucket boundaries. For
 the zero bucket and for buckets with custom boundaries, the arithmetic mean is used.
 For the usual exponential buckets, the geometric mean is used. Float samples are ignored
 and do not show up in the returned vector.
 
-Similarly, `histogram_stdvar(v instant-vector)` returns the estimated standard
-variance of observations for each histogram sample in `v`.
+Similarly, `histogram_stdvar(v instant-vector)` returns the estimated
+variance of observations for each native histogram sample in `v`.
 
 ## `hour()`
 
@@ -508,6 +535,15 @@ It is not a real instant vector, but uses a subset of its syntax.
 It must start and end with curly braces (`{ ... }`) and may only contain label matchers.
 The label matchers are used to constrain which info series to consider
 and which data labels to add to `v`.
+
+If there is no matching info series for a given time series in `v` at a
+particular timestamp (e.g. because the info series has gone stale), the
+behavior depends on the data label matchers: If the `data-label-selector`
+contains any matcher that does not match the empty string (e.g.
+`{data=~".+"}`), then that time series is dropped from the result at that
+timestamp, because the required enrichment is unavailable. If all matchers
+match the empty string (e.g. `{data=~".*"}`), or if no `data-label-selector`
+is provided, the time series is returned without enrichment.
 
 Identifying labels of an info series are the subset of labels that uniquely
 identify the info series. The remaining labels are considered
@@ -580,6 +616,12 @@ the name `target_info`. It also assumes that the identifying info series labels 
 `{__name__=~"(target|build)_info"}`. However, the identifying labels always
 have to be `instance` and `job`.
 
+When only negated `__name__` matchers are provided (e.g.
+`{__name__!="target_info"}`), `info` considers all metrics matching
+`.+_info` and then applies the negated matchers as filters. This is
+because negated matchers alone cannot positively identify which info
+metrics to consider.
+
 These limitations are partially defeating the purpose of the `info` function.
 At the current stage, this is an experiment to find out how useful the approach
 turns out to be in practice. A final version of the `info` function will indeed
@@ -651,6 +693,24 @@ This second example has the same effect than the first example, and illustrates 
 label_replace(up{job="api-server",service="a:c"}, "foo", "$name", "service", "(?P<name>.*):(?P<version>.*)")
 ```
 
+## `max_of()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`max_of(a scalar, b scalar)` returns the larger of the two scalar values `a`
+and `b`.
+
+## `min_of()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`min_of(a scalar, b scalar)` returns the smaller of the two scalar values `a`
+and `b`.
+
 ## `ln()`
 
 `ln(v instant-vector)` calculates the natural logarithm for all float samples
@@ -702,6 +762,15 @@ samples. Elements in the range vector that contain only histogram samples are
 ignored entirely. For elements that contain a mix of float and histogram
 samples, only the float samples are used as input, which is flagged by an
 info-level annotation.
+
+## `range()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`range()` returns the range duration of the current query range evaluation in
+seconds and is equivalent to `end() - start()`. For instant queries, this returns `0`.
 
 ## `rate()`
 
@@ -815,6 +884,33 @@ Same as `sort_by_label`, but sorts in descending order.
 `sqrt(v instant-vector)` calculates the square root of all float samples in
 `v`. Histogram samples in the input vector are ignored silently.
 
+## `start()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`start()` returns the start timestamp of the current query range evaluation as the
+number of seconds since January 1, 1970 UTC. For instant queries, this is equal
+to the evaluation timestamp.
+
+## `start_timestamp()`
+
+`start_timestamp(v instant-vector)` returns the start timestamp of each of the samples of
+the given vector as the number of seconds since January 1, 1970 UTC. It acts on
+float and histogram samples in the same way.
+
+This function only works when used directly on an instant vector and when `use-start-timestamps` feature flag is enabled. Otherwise, if it's used on an expression or if `use-start-timestamps` is disabled, it returns empty results.
+
+## `step()`
+
+**This function has to be enabled via the [feature
+flag](../feature_flags.md#experimental-promql-functions)
+`--enable-feature=promql-experimental-functions`.**
+
+`step()` returns the query resolution step as the number of seconds. For instant
+queries, this returns `0`.
+
 ## `time()`
 
 `time()` returns the number of seconds since January 1, 1970 UTC. Note that
@@ -849,8 +945,9 @@ over time and return an instant vector with per-series aggregation results:
 * `count_over_time(range-vector)`: the count of all samples in the specified interval.
 * `quantile_over_time(scalar, range-vector)`: the φ-quantile (0 ≤ φ ≤ 1) of all float samples in the specified interval.
 * `stddev_over_time(range-vector)`: the population standard deviation of all float samples in the specified interval.
-* `stdvar_over_time(range-vector)`: the population standard variance of all float samples in the specified interval.
+* `stdvar_over_time(range-vector)`: the population variance of all float samples in the specified interval.
 * `last_over_time(range-vector)`: the most recent sample in the specified interval.
+* `first_over_time(range-vector)`: the oldest sample in the specified interval.
 * `present_over_time(range-vector)`: the value 1 for any series in the specified interval.
 
 If the [feature flag](../feature_flags.md#experimental-promql-functions)
@@ -865,7 +962,6 @@ additional functions are available:
   that has the maximum value of all float samples in the specified interval.
 * `ts_of_last_over_time(range-vector)`: the timestamp of last sample in the
   specified interval.
-* `first_over_time(range-vector)`: the oldest sample in the specified interval.
 * `ts_of_first_over_time(range-vector)`: the timestamp of earliest sample in the
   specified interval.
 
@@ -891,8 +987,7 @@ These functions act on histograms in the following way:
 select the first sample of `m` _within_ the 1m range, where `m offset 1m` will
 select the most recent sample within the lookback interval _outside and prior
 to_ the 1m offset. This is particularly useful with `first_over_time(m[step()])`
-in range queries (available when `--enable-feature=promql-duration-expr` is set)
-to ensure that the sample selected is within the range step.
+in range queries to ensure that the sample selected is within the range step.
 
 ## Trigonometric Functions
 

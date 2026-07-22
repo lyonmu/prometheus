@@ -751,10 +751,11 @@ func TestRelabel(t *testing.T) {
 			require.NoError(t, cfg.Validate(model.UTF8Validation))
 		}
 
-		res, keep := Process(test.input, test.relabel...)
+		lb := labels.NewBuilder(test.input)
+		keep := ProcessBuilder(lb, test.relabel...)
 		require.Equal(t, !test.drop, keep)
 		if keep {
-			testutil.RequireEqual(t, test.output, res)
+			testutil.RequireEqual(t, test.output, lb.Labels())
 		}
 	}
 }
@@ -1064,9 +1065,11 @@ func BenchmarkRelabel(b *testing.B) {
 		require.NoError(b, err)
 	}
 	for _, tt := range tests {
+		lb := labels.NewBuilder(labels.EmptyLabels())
 		b.Run(tt.name, func(b *testing.B) {
 			for b.Loop() {
-				_, _ = Process(tt.lbls, tt.cfgs...)
+				lb.Reset(tt.lbls)
+				_ = ProcessBuilder(lb, tt.cfgs...)
 			}
 		})
 	}
@@ -1106,6 +1109,19 @@ replacement: $1
 action: replace
 `,
 		},
+		{
+			// https://github.com/prometheus/prometheus/issues/18652:
+			// explicit empty separator/replacement/regex must survive a YAML round-trip
+			// because they are distinct from the defaults (";", "$1", "(.*)").
+			name: "Explicit empty separator and replacement",
+			inputYaml: `source_labels: [namespace, k8s_app]
+separator: ""
+regex: ""
+target_label: target_cluster
+replacement: ""
+action: replace
+`,
+		},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
@@ -1141,15 +1157,15 @@ func TestRegexp_JSONUnmarshalThenMarshal(t *testing.T) {
 	}{
 		{
 			name:  "Empty regex",
-			input: `{"regex":""}`,
+			input: `{"separator":"","regex":"","replacement":""}`,
 		},
 		{
 			name:  "string literal",
-			input: `{"regex":"foo"}`,
+			input: `{"separator":"","regex":"foo","replacement":""}`,
 		},
 		{
 			name:  "regex",
-			input: `{"regex":".*foo.*"}`,
+			input: `{"separator":"","regex":".*foo.*","replacement":""}`,
 		},
 	}
 	for _, test := range tests {

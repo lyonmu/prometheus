@@ -21,7 +21,7 @@ import (
 
 	"github.com/prometheus/common/promslog"
 	"github.com/stretchr/testify/require"
-	"gopkg.in/yaml.v2"
+	"go.yaml.in/yaml/v2"
 )
 
 // TestOpenAPIHTTPHandler verifies that the OpenAPI endpoint serves a valid specification
@@ -30,7 +30,7 @@ func TestOpenAPIHTTPHandler(t *testing.T) {
 	builder := NewOpenAPIBuilder(OpenAPIOptions{}, promslog.NewNopLogger())
 
 	// First request.
-	req1 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+	req1 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
 	rec1 := httptest.NewRecorder()
 	builder.ServeOpenAPI(rec1, req1)
 
@@ -64,7 +64,7 @@ func TestOpenAPIHTTPHandler(t *testing.T) {
 	require.NotEmpty(t, paths, "paths should not be empty")
 
 	// Second request to verify response consistency.
-	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+	req2 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
 	rec2 := httptest.NewRecorder()
 	builder.ServeOpenAPI(rec2, req2)
 
@@ -118,7 +118,7 @@ func TestOpenAPIPathFiltering(t *testing.T) {
 				IncludePaths: tc.includePaths,
 			}, promslog.NewNopLogger())
 
-			req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+			req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
 			rec := httptest.NewRecorder()
 			builder.ServeOpenAPI(rec, req)
 
@@ -147,7 +147,7 @@ func TestOpenAPIPathFiltering(t *testing.T) {
 func TestOpenAPISchemaCompleteness(t *testing.T) {
 	builder := NewOpenAPIBuilder(OpenAPIOptions{}, promslog.NewNopLogger())
 
-	req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
 	rec := httptest.NewRecorder()
 	builder.ServeOpenAPI(rec, req)
 
@@ -251,14 +251,14 @@ func TestOpenAPIVersionConsistency(t *testing.T) {
 	builder := NewOpenAPIBuilder(OpenAPIOptions{}, promslog.NewNopLogger())
 
 	// Fetch OpenAPI 3.1 spec (default).
-	req31 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", nil)
+	req31 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
 	rec31 := httptest.NewRecorder()
 	builder.ServeOpenAPI(rec31, req31)
 
 	require.Equal(t, http.StatusOK, rec31.Code)
 
 	// Fetch OpenAPI 3.2 spec.
-	req32 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml?openapi_version=3.2", nil)
+	req32 := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml?openapi_version=3.2", http.NoBody)
 	rec32 := httptest.NewRecorder()
 	builder.ServeOpenAPI(rec32, req32)
 
@@ -286,4 +286,48 @@ func TestOpenAPIVersionConsistency(t *testing.T) {
 	// Verify 3.2 has exactly one more path than 3.1.
 	require.Len(t, paths32, len(paths31)+1,
 		"OpenAPI 3.2 should have exactly one more path than 3.1")
+}
+
+// TestOpenAPISearchDefaultLimit verifies that the search endpoint default for "limit"
+// reflects the MaxSearchLimit option when it is smaller than the built-in default.
+func TestOpenAPISearchDefaultLimit(t *testing.T) {
+	serveSpec := func(opts OpenAPIOptions) map[string]any {
+		builder := NewOpenAPIBuilder(opts, promslog.NewNopLogger())
+		req := httptest.NewRequest(http.MethodGet, "/api/v1/openapi.yaml", http.NoBody)
+		rec := httptest.NewRecorder()
+		builder.ServeOpenAPI(rec, req)
+		require.Equal(t, http.StatusOK, rec.Code)
+		var spec map[string]any
+		require.NoError(t, yaml.Unmarshal(rec.Body.Bytes(), &spec))
+		return spec
+	}
+
+	searchLimitDefault := func(spec map[string]any) any {
+		paths := spec["paths"].(map[any]any)
+		metricNames := paths["/search/metric_names"].(map[any]any)
+		get := metricNames["get"].(map[any]any)
+		params := get["parameters"].([]any)
+		for _, p := range params {
+			param := p.(map[any]any)
+			if param["name"] == "limit" {
+				return param["schema"].(map[any]any)["default"]
+			}
+		}
+		return nil
+	}
+
+	t.Run("default limit is 100 when no cap is set", func(t *testing.T) {
+		spec := serveSpec(OpenAPIOptions{})
+		require.Equal(t, 100, searchLimitDefault(spec))
+	})
+
+	t.Run("default limit is capped when MaxSearchLimit is smaller", func(t *testing.T) {
+		spec := serveSpec(OpenAPIOptions{MaxSearchLimit: 50})
+		require.Equal(t, 50, searchLimitDefault(spec))
+	})
+
+	t.Run("default limit is 100 when MaxSearchLimit exceeds default", func(t *testing.T) {
+		spec := serveSpec(OpenAPIOptions{MaxSearchLimit: 200})
+		require.Equal(t, 100, searchLimitDefault(spec))
+	})
 }

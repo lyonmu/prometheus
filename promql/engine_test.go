@@ -48,19 +48,17 @@ import (
 const (
 	env                  = "query execution"
 	defaultLookbackDelta = 5 * time.Minute
-	defaultEpsilon       = 0.000001 // Relative error allowed for sample values.
 )
 
 func TestMain(m *testing.M) {
-	// Enable experimental functions testing
-	parser.EnableExperimentalFunctions = true
 	testutil.TolerantVerifyLeak(m)
 }
 
 func TestQueryConcurrency(t *testing.T) {
 	maxConcurrency := 10
 
-	queryTracker := promql.NewActiveQueryTracker(t.TempDir(), maxConcurrency, nil)
+	queryTracker, err := promql.NewActiveQueryTracker(t.TempDir(), maxConcurrency, nil)
+	require.NoError(t, err)
 	opts := promql.EngineOpts{
 		Logger:             nil,
 		Reg:                nil,
@@ -96,11 +94,9 @@ func TestQueryConcurrency(t *testing.T) {
 	var wg sync.WaitGroup
 	for range maxConcurrency {
 		q := engine.NewTestQuery(f)
-		wg.Add(1)
-		go func() {
+		wg.Go(func() {
 			q.Exec(ctx)
-			wg.Done()
-		}()
+		})
 		select {
 		case <-processing:
 			// Expected.
@@ -110,11 +106,9 @@ func TestQueryConcurrency(t *testing.T) {
 	}
 
 	q := engine.NewTestQuery(f)
-	wg.Add(1)
-	go func() {
+	wg.Go(func() {
 		q.Exec(ctx)
-		wg.Done()
-	}()
+	})
 
 	select {
 	case <-processing:
@@ -789,22 +783,29 @@ load 10s
   metricWith1HistogramEvery10Seconds {{schema:1 count:5 sum:20 buckets:[1 2 1 1]}}+{{schema:1 count:10 sum:5 buckets:[1 2 3 4]}}x100
 `)
 
-	cases := []struct {
+	type testCase struct {
 		Query               string
 		SkipMaxCheck        bool
 		TotalSamples        int64
 		TotalSamplesPerStep stats.TotalSamplesPerStep
+		SamplesRead         int64                     // Samples read (delta for range-vector).
+		SamplesReadPerStep  stats.TotalSamplesPerStep // Per-step samples read.
 		PeakSamples         int
 		Start               time.Time
 		End                 time.Time
 		Interval            time.Duration
-	}{
+	}
+	cases := []testCase{
 		{
 			Query:        `"literal string"`,
 			SkipMaxCheck: true, // This can't fail from a max samples limit.
 			Start:        time.Unix(21, 0),
 			TotalSamples: 0,
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 0,
+			},
+			SamplesRead: 0,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 0,
 			},
 		},
@@ -816,6 +817,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 0,
 			},
+			SamplesRead: 0,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 0,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds",
@@ -825,6 +830,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
 		},
 		{
 			Query:        "metricWith1HistogramEvery10Seconds",
@@ -832,6 +841,10 @@ load 10s
 			PeakSamples:  13,
 			TotalSamples: 13, // 1 histogram HPoint of size 13 / 10 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 13,
+			},
+			SamplesRead: 13,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 13,
 			},
 		},
@@ -844,6 +857,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
 		},
 		{
 			Query:        "timestamp(metricWith1HistogramEvery10Seconds)",
@@ -851,6 +868,10 @@ load 10s
 			PeakSamples:  2,
 			TotalSamples: 1, // 1 float sample (because of timestamp) / 10 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
 		},
@@ -862,6 +883,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				22000: 1, // Aligned to the step time, not the sample time.
 			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				22000: 1,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds offset 10s",
@@ -869,6 +894,10 @@ load 10s
 			PeakSamples:  1,
 			TotalSamples: 1, // 1 sample / 10 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
 		},
@@ -880,6 +909,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
 		},
 		{
 			Query:        `metricWith3SampleEvery10Seconds{a="1"}`,
@@ -887,6 +920,10 @@ load 10s
 			PeakSamples:  1,
 			TotalSamples: 1, // 1 sample / 10 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
 		},
@@ -898,6 +935,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 1,
 			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 1,
+			},
 		},
 		{
 			Query:        `metricWith3SampleEvery10Seconds{a="1"}[20s] @ 19`,
@@ -905,6 +946,10 @@ load 10s
 			PeakSamples:  2,
 			TotalSamples: 2, // (1 sample / 10 seconds) * 20s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				21000: 2,
+			},
+			SamplesRead: 2,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				21000: 2,
 			},
 		},
@@ -916,6 +961,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				21000: 3,
 			},
+			SamplesRead: 3,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				21000: 3,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds[60s]",
@@ -923,6 +972,10 @@ load 10s
 			PeakSamples:  6,
 			TotalSamples: 6, // 1 sample / 10 seconds * 60 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 6,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 6,
 			},
 		},
@@ -934,6 +987,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 78,
 			},
+			SamplesRead: 78,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 78,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith1SampleEvery10Seconds[60s])[20s:5s]",
@@ -942,6 +999,10 @@ load 10s
 			TotalSamples: 24, // (1 sample / 10 seconds * 60 seconds) * 4
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 24,
+			},
+			SamplesRead: 8,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 8,
 			},
 		},
 		{
@@ -953,6 +1014,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 26,
 			},
+			SamplesRead: 8,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 8,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith1HistogramEvery10Seconds[60s])[20s:5s]",
@@ -962,6 +1027,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 312,
 			},
+			SamplesRead: 104,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 104,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds[60s] @ 30",
@@ -969,6 +1038,10 @@ load 10s
 			PeakSamples:  4,
 			TotalSamples: 4, // @ modifier force the evaluation to at 30 seconds - So it brings 4 datapoints (0, 10, 20, 30 seconds) * 1 series
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 4,
+			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 4,
 			},
 		},
@@ -980,6 +1053,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 52,
 			},
+			SamplesRead: 52,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 52,
+			},
 		},
 		{
 			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s] @ 30))",
@@ -987,6 +1064,10 @@ load 10s
 			PeakSamples:  7,
 			TotalSamples: 12, // @ modifier force the evaluation to at 30 seconds - So it brings 4 datapoints (0, 10, 20, 30 seconds) * 3 series
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+			},
+			SamplesRead: 12,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
 			},
 		},
@@ -998,6 +1079,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
 			},
+			SamplesRead: 12,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds[60s] offset 10s",
@@ -1005,6 +1090,10 @@ load 10s
 			PeakSamples:  6,
 			TotalSamples: 6, // 1 sample / 10 seconds * 60 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 6,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 6,
 			},
 		},
@@ -1016,6 +1105,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 18,
 			},
+			SamplesRead: 18,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 18,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith1SampleEvery10Seconds[60s])",
@@ -1023,6 +1116,10 @@ load 10s
 			PeakSamples:  7,
 			TotalSamples: 6, // 1 sample / 10 seconds * 60 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 6,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 6,
 			},
 		},
@@ -1034,6 +1131,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 6,
 			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 6,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith3SampleEvery10Seconds[60s])",
@@ -1041,6 +1142,10 @@ load 10s
 			PeakSamples:  9,
 			TotalSamples: 18, // 3 sample / 10 seconds * 60 seconds
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 18,
+			},
+			SamplesRead: 18,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 18,
 			},
 		},
@@ -1052,6 +1157,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
 			},
+			SamplesRead: 12,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+			},
 		},
 		{
 			Query:        "metricWith1SampleEvery10Seconds[60s:5s] offset 10s",
@@ -1059,6 +1168,10 @@ load 10s
 			PeakSamples:  12,
 			TotalSamples: 12, // 1 sample per query * 12 queries (60/5)
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+			},
+			SamplesRead: 12,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
 			},
 		},
@@ -1070,6 +1183,10 @@ load 10s
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 36,
 			},
+			SamplesRead: 36,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 36,
+			},
 		},
 		{
 			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s]))",
@@ -1077,6 +1194,10 @@ load 10s
 			PeakSamples:  52,
 			TotalSamples: 72, // 2 * (3 sample per query * 12 queries (60/5))
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 72,
+			},
+			SamplesRead: 72,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 72,
 			},
 		},
@@ -1088,6 +1209,13 @@ load 10s
 			PeakSamples:  4,
 			TotalSamples: 4, // 1 sample per query * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 1,
+				206000: 1,
+				211000: 1,
+				216000: 1,
+			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 1,
 				206000: 1,
 				211000: 1,
@@ -1107,6 +1235,13 @@ load 10s
 				214000: 1,
 				219000: 1,
 			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				204000: 1,
+				209000: 1,
+				214000: 1,
+				219000: 1,
+			},
 		},
 		{
 			Query:        `metricWith1HistogramEvery10Seconds`,
@@ -1121,6 +1256,13 @@ load 10s
 				214000: 13,
 				219000: 13,
 			},
+			SamplesRead: 52,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				204000: 13,
+				209000: 13,
+				214000: 13,
+				219000: 13,
+			},
 		},
 		{
 			// timestamp function has a special handling
@@ -1131,6 +1273,13 @@ load 10s
 			PeakSamples:  5,
 			TotalSamples: 4, // 1 sample per query * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 1,
+				206000: 1,
+				211000: 1,
+				216000: 1,
+			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 1,
 				206000: 1,
 				211000: 1,
@@ -1151,6 +1300,13 @@ load 10s
 				211000: 1,
 				216000: 1,
 			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 1,
+				206000: 1,
+				211000: 1,
+				216000: 1,
+			},
 		},
 		{
 			Query:        `max_over_time(metricWith3SampleEvery10Seconds{a="1"}[10s])`,
@@ -1160,6 +1316,13 @@ load 10s
 			PeakSamples:  2,
 			TotalSamples: 2, // 1 sample per query * 2 steps with data
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				991000:  1,
+				1001000: 1,
+				1011000: 0,
+				1021000: 0,
+			},
+			SamplesRead: 2,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				991000:  1,
 				1001000: 1,
 				1011000: 0,
@@ -1179,6 +1342,13 @@ load 10s
 				211000: 1,
 				216000: 1,
 			},
+			SamplesRead: 4,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 1,
+				206000: 1,
+				211000: 1,
+				216000: 1,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith3SampleEvery10Seconds[60s] @ 30)",
@@ -1193,6 +1363,13 @@ load 10s
 				211000: 12,
 				216000: 12,
 			},
+			SamplesRead: 12, // StepInvariantExpr: added once at step 0 only
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+				206000: 0,
+				211000: 0,
+				216000: 0,
+			},
 		},
 		{
 			Query:        `metricWith3SampleEvery10Seconds`,
@@ -1202,6 +1379,13 @@ load 10s
 			Interval:     5 * time.Second,
 			TotalSamples: 12, // 3 sample per query * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 3,
+				206000: 3,
+				211000: 3,
+				216000: 3,
+			},
+			SamplesRead: 12,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
 				201000: 3,
 				206000: 3,
 				211000: 3,
@@ -1221,13 +1405,20 @@ load 10s
 				211000: 18,
 				216000: 18,
 			},
+			SamplesRead: 21,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 18,
+				206000: 0,
+				211000: 3,
+				216000: 0,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith3SampleEvery10Seconds[60s:5s])",
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,
-			PeakSamples:  72,
+			PeakSamples:  69,
 			TotalSamples: 144, // 3 sample per query * 12 queries (60/5) * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 36,
@@ -1235,19 +1426,33 @@ load 10s
 				211000: 36,
 				216000: 36,
 			},
+			SamplesRead: 45,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 36,
+				206000: 3,
+				211000: 3,
+				216000: 3,
+			},
 		},
 		{
 			Query:        "max_over_time(metricWith1SampleEvery10Seconds[60s:5s])",
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,
-			PeakSamples:  32,
+			PeakSamples:  31,
 			TotalSamples: 48, // 1 sample per query * 12 queries (60/5) * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
 				206000: 12,
 				211000: 12,
 				216000: 12,
+			},
+			SamplesRead: 15,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+				206000: 1,
+				211000: 1,
+				216000: 1,
 			},
 		},
 		{
@@ -1255,7 +1460,7 @@ load 10s
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,
-			PeakSamples:  32,
+			PeakSamples:  31,
 			TotalSamples: 48, // 1 sample per query * 12 queries (60/5) * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 12,
@@ -1263,13 +1468,20 @@ load 10s
 				211000: 12,
 				216000: 12,
 			},
+			SamplesRead: 15,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 12,
+				206000: 1,
+				211000: 1,
+				216000: 1,
+			},
 		},
 		{
 			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s]))",
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,
-			PeakSamples:  76,
+			PeakSamples:  73,
 			TotalSamples: 288, // 2 * (3 sample per query * 12 queries (60/5) * 4 steps)
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 72,
@@ -1277,13 +1489,20 @@ load 10s
 				211000: 72,
 				216000: 72,
 			},
+			SamplesRead: 90,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 72,
+				206000: 6,
+				211000: 6,
+				216000: 6,
+			},
 		},
 		{
 			Query:        "sum(max_over_time(metricWith3SampleEvery10Seconds[60s:5s])) + sum(max_over_time(metricWith1SampleEvery10Seconds[60s:5s]))",
 			Start:        time.Unix(201, 0),
 			End:          time.Unix(220, 0),
 			Interval:     5 * time.Second,
-			PeakSamples:  72,
+			PeakSamples:  69,
 			TotalSamples: 192, // (1 sample per query * 12 queries (60/5) + 3 sample per query * 12 queries (60/5)) * 4 steps
 			TotalSamplesPerStep: stats.TotalSamplesPerStep{
 				201000: 48,
@@ -1291,41 +1510,349 @@ load 10s
 				211000: 48,
 				216000: 48,
 			},
+			SamplesRead: 60,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 48,
+				206000: 4,
+				211000: 4,
+				216000: 4,
+			},
 		},
+
+		// Instant subquery: basic SamplesRead merging.
+		{
+			Query:        "max_over_time(metricWith1SampleEvery10Seconds[20s:10s])",
+			Start:        time.Unix(201, 0),
+			PeakSamples:  5,
+			TotalSamples: 2,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 2,
+			},
+			SamplesRead: 2,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 2,
+			},
+		},
+
+		// Boundary: step == range, single inner evaluation.
+		{
+			Query:        "sum_over_time(metricWith1SampleEvery10Seconds[30s:30s])",
+			Start:        time.Unix(90, 0),
+			PeakSamples:  3,
+			TotalSamples: 1,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				90000: 1,
+			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				90000: 1,
+			},
+		},
+
+		// Boundary: step > range, sparse sampling.
+		{
+			Query:        "max_over_time(metricWith1SampleEvery10Seconds[30s:2m])",
+			Start:        time.Unix(240, 0),
+			PeakSamples:  3,
+			TotalSamples: 1,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				240000: 1,
+			},
+			SamplesRead: 1,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				240000: 1,
+			},
+		},
+
+		// Range query + subquery, non-overlapping windows (step >= range).
+		{
+			Query:        "max_over_time(metricWith1SampleEvery10Seconds[30s:10s])",
+			Start:        time.Unix(201, 0),
+			End:          time.Unix(231, 0),
+			Interval:     30 * time.Second,
+			PeakSamples:  11,
+			TotalSamples: 6,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 3,
+				231000: 3,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 3,
+				231000: 3,
+			},
+		},
+
+		// Range query + subquery, overlapping windows (range > step):
+		// SamplesRead < TotalSamples due to windowed delta attribution.
+		{
+			Query:        "max_over_time(metricWith1SampleEvery10Seconds[20s:10s])",
+			Start:        time.Unix(201, 0),
+			End:          time.Unix(261, 0),
+			Interval:     10 * time.Second,
+			PeakSamples:  17,
+			TotalSamples: 14,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 2,
+				211000: 2,
+				221000: 2,
+				231000: 2,
+				241000: 2,
+				251000: 2,
+				261000: 2,
+			},
+			SamplesRead: 8,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 2,
+				211000: 1,
+				221000: 1,
+				231000: 1,
+				241000: 1,
+				251000: 1,
+				261000: 1,
+			},
+		},
+
+		// Range query + subquery, outer step wider than subquery range.
+		// Subquery materialises 9 samples (T=180,190,...,260) but only the
+		// 3 samples in each outer step's window contribute to that step's
+		// output; the 3 samples in the gap (201,231] between outer windows
+		// are not counted.
+		{
+			Query:        "max_over_time(metricWith1SampleEvery10Seconds[30s:10s])",
+			Start:        time.Unix(201, 0),
+			End:          time.Unix(261, 0),
+			Interval:     1 * time.Minute,
+			PeakSamples:  14,
+			TotalSamples: 6,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 3,
+				261000: 3,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 3,
+				261000: 3,
+			},
+		},
+
+		// Histogram subquery: histogram size counting in subquery path.
+		{
+			Query:        "histogram_count(max_over_time(metricWith1HistogramEvery10Seconds[20s:10s]))",
+			Start:        time.Unix(201, 0),
+			PeakSamples:  52,
+			TotalSamples: 26,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				201000: 26,
+			},
+			SamplesRead: 26,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				201000: 26,
+			},
+		},
+
+		// Histogram range query + subquery: histogram delta attribution.
+		{
+			Query:        "avg_over_time(metricWith1HistogramEvery10Seconds[2m:1m])",
+			Start:        time.Unix(120, 0),
+			End:          time.Unix(240, 0),
+			Interval:     60 * time.Second,
+			PeakSamples:  117,
+			TotalSamples: 78,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				120000: 26,
+				180000: 26,
+				240000: 26,
+			},
+			SamplesRead: 52,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				120000: 26,
+				180000: 13,
+				240000: 13,
+			},
+		},
+
+		// Range query with multiple series + subquery: covers cardinality.
+		{
+			Query:        "max_over_time(metricWith3SampleEvery10Seconds[60s:10s])",
+			Start:        time.Unix(200, 0),
+			End:          time.Unix(400, 0),
+			Interval:     30 * time.Second,
+			PeakSamples:  99,
+			TotalSamples: 126,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				200000: 18,
+				230000: 18,
+				260000: 18,
+				290000: 18,
+				320000: 18,
+				350000: 18,
+				380000: 18,
+			},
+			SamplesRead: 72,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				200000: 18,
+				230000: 9,
+				260000: 9,
+				290000: 9,
+				320000: 9,
+				350000: 9,
+				380000: 9,
+			},
+		},
+
+		// Range query with @ modifier on a matrix selector wrapped in an
+		// at-modifier-unsafe function (predict_linear), so the call is not
+		// hoisted into a step-invariant expression. The @ modifier freezes
+		// the evaluation window, so every parent step consumes the same
+		// matrix. TotalSamples must reflect the full window at every step;
+		// SamplesRead is counted only once (no new I/O after step 0).
+		{
+			Query:        "predict_linear(metricWith1SampleEvery10Seconds[60s] @ 100, 60)",
+			Start:        time.Unix(100, 0),
+			End:          time.Unix(300, 0),
+			Interval:     100 * time.Second,
+			PeakSamples:  12,
+			TotalSamples: 18, // 6 samples per window * 3 steps.
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				100000: 6,
+				200000: 6,
+				300000: 6,
+			},
+			SamplesRead: 6, // @ modifier: single read at step 0; later steps reuse.
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				100000: 6,
+				200000: 0,
+				300000: 0,
+			},
+		},
+
+		// Subquery with @ modifier.
+		{
+			Query:        "sum_over_time(metricWith3SampleEvery10Seconds[20s:10s] @ 200)",
+			Start:        time.Unix(250, 0),
+			PeakSamples:  11,
+			TotalSamples: 6,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				250000: 6,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				250000: 6,
+			},
+		},
+
+		// Subquery with offset.
+		{
+			Query:        "sum_over_time(metricWith1SampleEvery10Seconds[20s:10s] offset 1m)",
+			Start:        time.Unix(240, 0),
+			PeakSamples:  5,
+			TotalSamples: 2,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				240000: 2,
+			},
+			SamplesRead: 2,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				240000: 2,
+			},
+		},
+
+		// Subquery with offset + @ modifier combined.
+		{
+			Query:        "sum_over_time(metricWith3SampleEvery10Seconds[1m:10s] @ 200 offset 1m)",
+			Start:        time.Unix(300, 0),
+			PeakSamples:  27,
+			TotalSamples: 18,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				300000: 18,
+			},
+			SamplesRead: 18,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				300000: 18,
+			},
+		},
+
+		// Nested subquery: recursive merging across two subquery levels.
+		{
+			Query:        "sum_over_time(max_over_time(metricWith3SampleEvery10Seconds[60s] @ 300)[5m:1m] @ 600)[10m:2m]",
+			Start:        time.Unix(800, 0),
+			PeakSamples:  23,
+			TotalSamples: 75,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				800000: 75,
+			},
+			SamplesRead: 18,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				800000: 18,
+			},
+		},
+
+		// Outer subquery wrapping inner range-vector (evalSubquery path):
+		// SamplesRead > TotalSamples because inner subquery reads more data than it surfaces.
+		{
+			Query:        "rate(sum_over_time(metricWith1SampleEvery10Seconds[30s])[1m:30s])",
+			Start:        time.Unix(240, 0),
+			PeakSamples:  5,
+			TotalSamples: 2,
+			TotalSamplesPerStep: stats.TotalSamplesPerStep{
+				240000: 2,
+			},
+			SamplesRead: 6,
+			SamplesReadPerStep: stats.TotalSamplesPerStep{
+				240000: 6,
+			},
+		},
+	}
+
+	runQuery := func(t *testing.T, engine promql.QueryEngine, opts promql.QueryOpts, c testCase, expErr error) *stats.Statistics {
+		t.Helper()
+		var err error
+		var qry promql.Query
+		if c.Interval == 0 {
+			qry, err = engine.NewInstantQuery(context.Background(), storage, opts, c.Query, c.Start)
+		} else {
+			qry, err = engine.NewRangeQuery(context.Background(), storage, opts, c.Query, c.Start, c.End, c.Interval)
+		}
+		require.NoError(t, err)
+
+		res := qry.Exec(context.Background())
+		require.Equal(t, expErr, res.Err)
+
+		return qry.Stats()
 	}
 
 	for _, c := range cases {
 		t.Run(c.Query, func(t *testing.T) {
-			opts := promql.NewPrometheusQueryOpts(true, 0)
-			engine := promqltest.NewTestEngine(t, true, 0, promqltest.DefaultMaxSamplesPerQuery)
+			t.Run("perStepEnabled", func(t *testing.T) {
+				opts := promql.NewPrometheusQueryOpts(true, 0)
+				engine := promqltest.NewTestEngine(t, true, 0, promqltest.DefaultMaxSamplesPerQuery)
 
-			runQuery := func(expErr error) *stats.Statistics {
-				var err error
-				var qry promql.Query
-				if c.Interval == 0 {
-					qry, err = engine.NewInstantQuery(context.Background(), storage, opts, c.Query, c.Start)
-				} else {
-					qry, err = engine.NewRangeQuery(context.Background(), storage, opts, c.Query, c.Start, c.End, c.Interval)
+				stats := runQuery(t, engine, opts, c, nil)
+				require.Equal(t, c.TotalSamples, stats.Samples.TotalSamples, "Total samples mismatch")
+				require.Equal(t, &c.TotalSamplesPerStep, stats.Samples.TotalSamplesPerStepMap(), "Total samples per time mismatch")
+				require.Equal(t, c.SamplesRead, stats.Samples.SamplesRead, "Samples read mismatch")
+				require.Equal(t, &c.SamplesReadPerStep, stats.Samples.SamplesReadPerStepMap(), "Samples read per step mismatch")
+				require.Equal(t, c.PeakSamples, stats.Samples.PeakSamples, "Peak samples mismatch")
+
+				// Re-run with the max set to one less than the observed peak;
+				// confirms the peak is what gates the query.max-samples limit.
+				if c.SkipMaxCheck {
+					return
 				}
-				require.NoError(t, err)
+				engine = promqltest.NewTestEngine(t, true, 0, stats.Samples.PeakSamples-1)
+				runQuery(t, engine, opts, c, promql.ErrTooManySamples(env))
+			})
 
-				res := qry.Exec(context.Background())
-				require.Equal(t, expErr, res.Err)
+			t.Run("perStepDisabled", func(t *testing.T) {
+				opts := promql.NewPrometheusQueryOpts(false, 0)
+				engine := promqltest.NewTestEngine(t, false, 0, promqltest.DefaultMaxSamplesPerQuery)
 
-				return qry.Stats()
-			}
-
-			stats := runQuery(nil)
-			require.Equal(t, c.TotalSamples, stats.Samples.TotalSamples, "Total samples mismatch")
-			require.Equal(t, &c.TotalSamplesPerStep, stats.Samples.TotalSamplesPerStepMap(), "Total samples per time mismatch")
-			require.Equal(t, c.PeakSamples, stats.Samples.PeakSamples, "Peak samples mismatch")
-
-			// Check that the peak is correct by setting the max to one less.
-			if c.SkipMaxCheck {
-				return
-			}
-			engine = promqltest.NewTestEngine(t, true, 0, stats.Samples.PeakSamples-1)
-			runQuery(promql.ErrTooManySamples(env))
+				stats := runQuery(t, engine, opts, c, nil)
+				require.Equal(t, c.TotalSamples, stats.Samples.TotalSamples,
+					"TotalSamples should match when per-step stats are disabled")
+				require.Equal(t, c.SamplesRead, stats.Samples.SamplesRead,
+					"SamplesRead should match when per-step stats are disabled")
+			})
 		})
 	}
 }
@@ -1336,6 +1863,7 @@ load 10s
   metric 1+1x100
   bigmetric{a="1"} 1+1x100
   bigmetric{a="2"} 1+1x100
+  metricWith1HistogramEvery10Seconds {{schema:1 count:5 sum:20 buckets:[1 2 1 1]}}+{{schema:1 count:10 sum:5 buckets:[1 2 3 4]}}x100
 `)
 
 	// These test cases should be touching the limit exactly (hence no exceeding).
@@ -1472,6 +2000,11 @@ load 10s
 			MaxSamples: 34,
 			Start:      time.Unix(10, 0),
 		},
+		{
+			Query:      "max_over_time(metricWith1HistogramEvery10Seconds[61s])[20s:5s]",
+			MaxSamples: 91,
+			Start:      time.Unix(201, 0),
+		},
 	}
 
 	for _, c := range cases {
@@ -1508,11 +2041,6 @@ load 10s
 }
 
 func TestExtendedRangeSelectors(t *testing.T) {
-	parser.EnableExtendedRangeSelectors = true
-	t.Cleanup(func() {
-		parser.EnableExtendedRangeSelectors = false
-	})
-
 	engine := newTestEngine(t)
 	storage := promqltest.LoadedStorage(t, `
 	load 10s
@@ -1658,6 +2186,40 @@ func TestExtendedRangeSelectors(t *testing.T) {
 			require.Equal(t, tc.expected, res.Value)
 		})
 	}
+}
+
+// TestParserConfigIsolation ensures the engine's parser configuration is respected.
+func TestParserConfigIsolation(t *testing.T) {
+	ctx := context.Background()
+	storage := promqltest.LoadedStorage(t, `
+		load 10s
+			metric 1+1x10
+	`)
+	t.Cleanup(func() { storage.Close() })
+
+	query := "metric[10s] smoothed"
+	t.Run("engine_with_feature_disabled_rejects", func(t *testing.T) {
+		engine := promql.NewEngine(promql.EngineOpts{
+			MaxSamples: 1000, Timeout: 10 * time.Second,
+			Parser: parser.NewParser(parser.Options{EnableExtendedRangeSelectors: false}),
+		})
+		t.Cleanup(func() { _ = engine.Close() })
+		_, err := engine.NewInstantQuery(ctx, storage, nil, query, time.Unix(10, 0))
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "parse")
+	})
+	t.Run("engine_with_feature_enabled_accepts", func(t *testing.T) {
+		engine := promql.NewEngine(promql.EngineOpts{
+			MaxSamples: 1000, Timeout: 10 * time.Second,
+			Parser: parser.NewParser(parser.Options{EnableExtendedRangeSelectors: true}),
+		})
+		t.Cleanup(func() { _ = engine.Close() })
+		q, err := engine.NewInstantQuery(ctx, storage, nil, query, time.Unix(10, 0))
+		require.NoError(t, err)
+		defer q.Close()
+		res := q.Exec(ctx)
+		require.NoError(t, res.Err)
+	})
 }
 
 func TestAtModifier(t *testing.T) {
@@ -3229,11 +3791,64 @@ func TestPreprocessAndWrapWithStepInvariantExpr(t *testing.T) {
 				},
 			},
 		},
+		{
+			input: "timestamp(metric @ 10)",
+			expected: &parser.StepInvariantExpr{
+				Expr: &parser.Call{
+					Func: parser.MustGetFunction("timestamp"),
+					Args: parser.Expressions{
+						&parser.VectorSelector{
+							Name:      "metric",
+							Timestamp: makeInt64Pointer(10000),
+							LabelMatchers: []*labels.Matcher{
+								parser.MustLabelMatcher(labels.MatchEqual, "__name__", "metric"),
+							},
+							PosRange: posrange.PositionRange{
+								Start: 10,
+								End:   21,
+							},
+						},
+					},
+					PosRange: posrange.PositionRange{Start: 0, End: 22},
+				},
+			},
+		},
+		{
+			input: "timestamp(abs(metric @ 10))",
+			expected: &parser.Call{
+				Func: parser.MustGetFunction("timestamp"),
+				Args: parser.Expressions{
+					&parser.StepInvariantExpr{
+						Expr: &parser.Call{
+							Func: parser.MustGetFunction("abs"),
+							Args: parser.Expressions{
+								&parser.VectorSelector{
+									Name:      "metric",
+									Timestamp: makeInt64Pointer(10000),
+									LabelMatchers: []*labels.Matcher{
+										parser.MustLabelMatcher(labels.MatchEqual, "__name__", "metric"),
+									},
+									PosRange: posrange.PositionRange{
+										Start: 14,
+										End:   25,
+									},
+								},
+							},
+							PosRange: posrange.PositionRange{
+								Start: 10,
+								End:   26,
+							},
+						},
+					},
+				},
+				PosRange: posrange.PositionRange{Start: 0, End: 27},
+			},
+		},
 	}
 
 	for _, test := range testCases {
 		t.Run(test.input, func(t *testing.T) {
-			expr, err := parser.ParseExpr(test.input)
+			expr, err := testParser.ParseExpr(test.input)
 			require.NoError(t, err)
 			expr, err = promql.PreprocessExpr(expr, startTime, endTime, 0)
 			require.NoError(t, err)
@@ -3842,6 +4457,7 @@ func TestEvaluationWithDelayedNameRemovalDisabled(t *testing.T) {
 		MaxSamples:               10000,
 		Timeout:                  10 * time.Second,
 		EnableDelayedNameRemoval: false,
+		Parser:                   parser.NewParser(promqltest.TestParserOpts),
 	}
 	engine := promqltest.NewTestEngineWithOpts(t, opts)
 

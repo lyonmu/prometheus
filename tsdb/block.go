@@ -33,7 +33,6 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
-	tsdb_errors "github.com/prometheus/prometheus/tsdb/errors"
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/index"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
@@ -240,6 +239,18 @@ func (bm *BlockMetaCompaction) FromStaleSeries() bool {
 	return slices.Contains(bm.Hints, CompactionHintFromStaleSeries)
 }
 
+func (bm *BlockMetaCompaction) SetSelectedSeries() {
+	if bm.FromSelectedSeries() {
+		return
+	}
+	bm.Hints = append(bm.Hints, CompactionHintFromSelectedSeries)
+	slices.Sort(bm.Hints)
+}
+
+func (bm *BlockMetaCompaction) FromSelectedSeries() bool {
+	return slices.Contains(bm.Hints, CompactionHintFromSelectedSeries)
+}
+
 const (
 	indexFilename = "index"
 	metaFilename  = "meta.json"
@@ -252,6 +263,10 @@ const (
 	// CompactionHintFromStaleSeries is a hint noting that the block
 	// was created from stale series.
 	CompactionHintFromStaleSeries = "from-stale-series"
+
+	// CompactionHintFromSelectedSeries is a hint noting that the block
+	// was created from an explicit, caller-supplied list of series refs.
+	CompactionHintFromSelectedSeries = "from-selected-series"
 )
 
 func chunkDir(dir string) string { return filepath.Join(dir, "chunks") }
@@ -292,17 +307,17 @@ func writeMetaFile(logger *slog.Logger, dir string, meta *BlockMeta) (int64, err
 
 	jsonMeta, err := json.MarshalIndent(meta, "", "\t")
 	if err != nil {
-		return 0, err
+		return 0, errors.Join(err, f.Close())
 	}
 
 	n, err := f.Write(jsonMeta)
 	if err != nil {
-		return 0, tsdb_errors.NewMulti(err, f.Close()).Err()
+		return 0, errors.Join(err, f.Close())
 	}
 
 	// Force the kernel to persist the file on disk to avoid data loss if the host crashes.
 	if err := f.Sync(); err != nil {
-		return 0, tsdb_errors.NewMulti(err, f.Close()).Err()
+		return 0, errors.Join(err, f.Close())
 	}
 	if err := f.Close(); err != nil {
 		return 0, err
@@ -344,7 +359,7 @@ func OpenBlock(logger *slog.Logger, dir string, pool chunkenc.Pool, postingsDeco
 	var closers []io.Closer
 	defer func() {
 		if err != nil {
-			err = tsdb_errors.NewMulti(err, tsdb_errors.CloseAll(closers)).Err()
+			err = errors.Join(err, closeAll(closers))
 		}
 	}()
 	meta, sizeMeta, err := readMetaFile(dir)
@@ -398,11 +413,11 @@ func (pb *Block) Close() error {
 
 	pb.pendingReaders.Wait()
 
-	return tsdb_errors.NewMulti(
+	return errors.Join(
 		pb.chunkr.Close(),
 		pb.indexr.Close(),
 		pb.tombstones.Close(),
-	).Err()
+	)
 }
 
 func (pb *Block) String() string {

@@ -159,17 +159,14 @@ func (b *writeBenchmark) ingestScrapes(lbls []labels.Labels, scrapeCount int) (u
 			batch := lbls[:l]
 			lbls = lbls[l:]
 
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-
+			wg.Go(func() {
 				n, err := b.ingestScrapesShard(batch, 100, int64(timeDelta*i))
 				if err != nil {
 					// exitWithError(err)
 					fmt.Println(" err", err)
 				}
 				total.Add(n)
-			}()
+			})
 		}
 		wg.Wait()
 	}
@@ -408,13 +405,13 @@ func openBlock(path, blockID string) (*tsdb.DBReadOnly, tsdb.BlockReader, error)
 	return db, b, nil
 }
 
-func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExtended bool, matchers string) error {
+func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExtended bool, matchers string, p parser.Parser) error {
 	var (
 		selectors []*labels.Matcher
 		err       error
 	)
-	if len(matchers) > 0 {
-		selectors, err = parser.ParseMetricSelector(matchers)
+	if matchers != "" {
+		selectors, err = p.ParseMetricSelector(matchers)
 		if err != nil {
 			return err
 		}
@@ -432,7 +429,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 	// Presume 1ms resolution that Prometheus uses.
 	fmt.Printf("Duration: %s\n", (time.Duration(meta.MaxTime-meta.MinTime) * 1e6).String())
 	fmt.Printf("Total Series: %d\n", meta.Stats.NumSeries)
-	if len(matchers) > 0 {
+	if matchers != "" {
 		fmt.Printf("Matcher: %s\n", matchers)
 	}
 	ir, err := block.Index()
@@ -478,24 +475,24 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 	labelpairsCount := map[string]uint64{}
 	entries := 0
 	var (
-		p    index.Postings
-		refs []storage.SeriesRef
+		postings index.Postings
+		refs     []storage.SeriesRef
 	)
-	if len(matchers) > 0 {
-		p, err = tsdb.PostingsForMatchers(ctx, ir, selectors...)
+	if matchers != "" {
+		postings, err = tsdb.PostingsForMatchers(ctx, ir, selectors...)
 		if err != nil {
 			return err
 		}
 		// Expand refs first and cache in memory.
 		// So later we don't have to expand again.
-		refs, err = index.ExpandPostings(p)
+		refs, err = index.ExpandPostings(postings)
 		if err != nil {
 			return err
 		}
 		fmt.Printf("Matched series: %d\n", len(refs))
-		p = index.NewListPostings(refs)
+		postings = index.NewListPostings(refs)
 	} else {
-		p, err = ir.Postings(ctx, "", "") // The special all key.
+		postings, err = ir.Postings(ctx, "", "") // The special all key.
 		if err != nil {
 			return err
 		}
@@ -503,8 +500,8 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 
 	chks := []chunks.Meta{}
 	builder := labels.ScratchBuilder{}
-	for p.Next() {
-		if err = ir.Series(p.At(), &builder, &chks); err != nil {
+	for postings.Next() {
+		if err = ir.Series(postings.At(), &builder, &chks); err != nil {
 			return err
 		}
 		// Amount of the block time range not covered by this series.
@@ -517,8 +514,8 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 			entries++
 		})
 	}
-	if p.Err() != nil {
-		return p.Err()
+	if postings.Err() != nil {
+		return postings.Err()
 	}
 	fmt.Printf("Postings (unique label pairs): %d\n", len(labelpairsUncovered))
 	fmt.Printf("Postings entries (total label pairs): %d\n", entries)
@@ -528,7 +525,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		postingInfos = append(postingInfos, postingInfo{k, uint64(float64(m) / float64(meta.MaxTime-meta.MinTime))})
 	}
 
-	fmt.Printf("\nLabel pairs most involved in churning:\n")
+	fmt.Print("\nLabel pairs most involved in churning:\n")
 	printInfo(postingInfos)
 
 	postingInfos = postingInfos[:0]
@@ -536,7 +533,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		postingInfos = append(postingInfos, postingInfo{k, uint64(float64(m) / float64(meta.MaxTime-meta.MinTime))})
 	}
 
-	fmt.Printf("\nLabel names most involved in churning:\n")
+	fmt.Print("\nLabel names most involved in churning:\n")
 	printInfo(postingInfos)
 
 	postingInfos = postingInfos[:0]
@@ -544,7 +541,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		postingInfos = append(postingInfos, postingInfo{k, m})
 	}
 
-	fmt.Printf("\nMost common label pairs:\n")
+	fmt.Print("\nMost common label pairs:\n")
 	printInfo(postingInfos)
 
 	postingInfos = postingInfos[:0]
@@ -560,7 +557,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		postingInfos = append(postingInfos, postingInfo{n, cumulativeLength})
 	}
 
-	fmt.Printf("\nLabel names with highest cumulative label value length:\n")
+	fmt.Print("\nLabel names with highest cumulative label value length:\n")
 	printInfo(postingInfos)
 
 	postingInfos = postingInfos[:0]
@@ -571,7 +568,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		}
 		postingInfos = append(postingInfos, postingInfo{n, uint64(len(lv))})
 	}
-	fmt.Printf("\nHighest cardinality labels:\n")
+	fmt.Print("\nHighest cardinality labels:\n")
 	printInfo(postingInfos)
 
 	postingInfos = postingInfos[:0]
@@ -585,7 +582,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 			return err
 		}
 		// Only intersect postings if matchers are specified.
-		if len(matchers) > 0 {
+		if matchers != "" {
 			postings = index.Intersect(postings, index.NewListPostings(refs))
 		}
 		count := 0
@@ -597,7 +594,7 @@ func analyzeBlock(ctx context.Context, path, blockID string, limit int, runExten
 		}
 		postingInfos = append(postingInfos, postingInfo{n, uint64(count)})
 	}
-	fmt.Printf("\nHighest cardinality metric names:\n")
+	fmt.Print("\nHighest cardinality metric names:\n")
 	printInfo(postingInfos)
 
 	if runExtended {
@@ -652,17 +649,18 @@ func analyzeCompaction(ctx context.Context, block tsdb.BlockReader, indexr tsdb.
 				return errors.New("ChunkOrIterable should not return an iterable when reading a block")
 			}
 			switch chk.Encoding() {
-			case chunkenc.EncXOR:
+			case chunkenc.EncXOR, chunkenc.EncXOR2:
 				floatChunkSamplesCount = append(floatChunkSamplesCount, chk.NumSamples())
 				floatChunkSize = append(floatChunkSize, len(chk.Bytes()))
-			case chunkenc.EncFloatHistogram:
+			case chunkenc.EncFloatHistogram, chunkenc.EncFloatHistogramST:
 				histogramChunkSamplesCount = append(histogramChunkSamplesCount, chk.NumSamples())
 				histogramChunkSize = append(histogramChunkSize, len(chk.Bytes()))
-				fhchk, ok := chk.(*chunkenc.FloatHistogramChunk)
-				if !ok {
-					return errors.New("chunk is not FloatHistogramChunk")
+				if _, ok := chk.(*chunkenc.FloatHistogramChunk); !ok {
+					if _, ok := chk.(*chunkenc.FloatHistogramSTChunk); !ok {
+						return errors.New("chunk is not FloatHistogramChunk or FloatHistogramSTChunk")
+					}
 				}
-				it := fhchk.Iterator(nil)
+				it := chk.Iterator(nil)
 				bucketCount := 0
 				for it.Next() == chunkenc.ValFloatHistogram {
 					_, f := it.AtFloatHistogram(nil)
@@ -670,14 +668,15 @@ func analyzeCompaction(ctx context.Context, block tsdb.BlockReader, indexr tsdb.
 					bucketCount += len(f.NegativeBuckets)
 				}
 				histogramChunkBucketsCount = append(histogramChunkBucketsCount, bucketCount)
-			case chunkenc.EncHistogram:
+			case chunkenc.EncHistogram, chunkenc.EncHistogramST:
 				histogramChunkSamplesCount = append(histogramChunkSamplesCount, chk.NumSamples())
 				histogramChunkSize = append(histogramChunkSize, len(chk.Bytes()))
-				hchk, ok := chk.(*chunkenc.HistogramChunk)
-				if !ok {
-					return errors.New("chunk is not HistogramChunk")
+				if _, ok := chk.(*chunkenc.HistogramChunk); !ok {
+					if _, ok := chk.(*chunkenc.HistogramSTChunk); !ok {
+						return errors.New("chunk is not HistogramChunk or HistogramSTChunk")
+					}
 				}
-				it := hchk.Iterator(nil)
+				it := chk.Iterator(nil)
 				bucketCount := 0
 				for it.Next() == chunkenc.ValHistogram {
 					_, f := it.AtHistogram(nil)
@@ -690,7 +689,7 @@ func analyzeCompaction(ctx context.Context, block tsdb.BlockReader, indexr tsdb.
 		}
 	}
 
-	fmt.Printf("\nCompaction analysis:\n")
+	fmt.Print("\nCompaction analysis:\n")
 	fmt.Println()
 	displayHistogram("samples per float chunk", floatChunkSamplesCount, totalChunks)
 
@@ -706,7 +705,7 @@ func analyzeCompaction(ctx context.Context, block tsdb.BlockReader, indexr tsdb.
 
 type SeriesSetFormatter func(series storage.SeriesSet) error
 
-func dumpTSDBData(ctx context.Context, dbDir, sandboxDirRoot string, mint, maxt int64, match []string, formatter SeriesSetFormatter) (err error) {
+func dumpTSDBData(ctx context.Context, dbDir, sandboxDirRoot string, mint, maxt int64, match []string, formatter SeriesSetFormatter, p parser.Parser) (err error) {
 	db, err := tsdb.OpenDBReadOnly(dbDir, sandboxDirRoot, nil)
 	if err != nil {
 		return err
@@ -720,7 +719,7 @@ func dumpTSDBData(ctx context.Context, dbDir, sandboxDirRoot string, mint, maxt 
 	}
 	defer q.Close()
 
-	matcherSets, err := parser.ParseMetricSelectors(match)
+	matcherSets, err := p.ParseMetricSelectors(match)
 	if err != nil {
 		return err
 	}

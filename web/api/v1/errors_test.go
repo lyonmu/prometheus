@@ -34,6 +34,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/promql/promqltest"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
@@ -109,7 +110,7 @@ func TestApiStatusCodes(t *testing.T) {
 				r := createPrometheusAPI(t, q, tc.overrideErrorCode)
 				rec := httptest.NewRecorder()
 
-				req := httptest.NewRequest(http.MethodGet, "/api/v1/query?query=up", nil)
+				req := httptest.NewRequest(http.MethodGet, "/api/v1/query?query=up", http.NoBody)
 
 				r.ServeHTTP(rec, req)
 
@@ -134,7 +135,7 @@ func createPrometheusAPI(t *testing.T, q storage.SampleAndChunkQueryable, overri
 	api := NewAPI(
 		engine,
 		q,
-		nil,
+		nil, nil,
 		nil,
 		func(context.Context) ScrapePoolsRetriever { return &DummyScrapePoolsRetriever{} },
 		func(context.Context) TargetRetriever { return &DummyTargetRetriever{} },
@@ -146,6 +147,8 @@ func createPrometheusAPI(t *testing.T, q storage.SampleAndChunkQueryable, overri
 		nil,   // Only needed for admin APIs.
 		"",    // This is for snapshots, which is disabled when admin APIs are disabled. Hence empty.
 		false, // Disable admin APIs.
+		false, // Disable search API.
+		0,     // Default search max-limit.
 		promslog.NewNopLogger(),
 		func(context.Context) RulesRetriever { return &DummyRulesRetriever{} },
 		0, 0, 0, // Remote read samples and concurrency limit.
@@ -170,6 +173,7 @@ func createPrometheusAPI(t *testing.T, q storage.SampleAndChunkQueryable, overri
 		overrideErrorCode,
 		nil,
 		OpenAPIOptions{},
+		parser.NewParser(parser.Options{}),
 	)
 
 	promRouter := route.New().WithPrefix("/api/v1")

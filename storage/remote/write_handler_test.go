@@ -423,6 +423,36 @@ func TestRemoteWriteHandler_V2Message(t *testing.T) {
 			expectedRespBody: "parsing labels for series [1 999]: labelRefs 1 (name) = 999 (value) outside of symbols table (size 18)\n",
 		},
 		{
+			desc: "Partial write; first series with out-of-bounds metadata unit ref",
+			input: append(
+				[]writev2.TimeSeries{{
+					LabelsRefs: []uint32{1, 2},
+					Metadata: writev2.Metadata{
+						Type:    writev2.Metadata_METRIC_TYPE_GAUGE,
+						UnitRef: 999,
+					},
+					Samples: []writev2.Sample{{Value: 1, Timestamp: 1}},
+				}},
+				writeV2RequestFixture.Timeseries...),
+			expectedCode:     http.StatusBadRequest,
+			expectedRespBody: "parsing metadata for series [1 2]: metadata unit_ref 999 outside of symbols table (size 18)\n",
+		},
+		{
+			desc: "Partial write; first series with out-of-bounds metadata help ref",
+			input: append(
+				[]writev2.TimeSeries{{
+					LabelsRefs: []uint32{1, 2},
+					Metadata: writev2.Metadata{
+						Type:    writev2.Metadata_METRIC_TYPE_GAUGE,
+						HelpRef: 999,
+					},
+					Samples: []writev2.Sample{{Value: 1, Timestamp: 1}},
+				}},
+				writeV2RequestFixture.Timeseries...),
+			expectedCode:     http.StatusBadRequest,
+			expectedRespBody: "parsing metadata for series [1 2]: metadata help_ref 999 outside of symbols table (size 18)\n",
+		},
+		{
 			desc: "Partial write; TimeSeries with only exemplars (no samples or histograms)",
 			input: append(
 				// Series with only exemplars, no samples or histograms.
@@ -462,7 +492,7 @@ func TestRemoteWriteHandler_V2Message(t *testing.T) {
 			desc: "Partial write; first series with one OOO histogram sample",
 			input: func() []writev2.TimeSeries {
 				f := proto.Clone(writeV2RequestFixture).(*writev2.Request)
-				f.Timeseries[0].Histograms = append(f.Timeseries[0].Histograms, writev2.FromFloatHistogram(1, testHistogram.ToFloat(nil)))
+				f.Timeseries[0].Histograms = append(f.Timeseries[0].Histograms, writev2.FromFloatHistogram(0, 1, testHistogram.ToFloat(nil)))
 				return f.Timeseries
 			}(),
 			expectedCode:     http.StatusBadRequest,
@@ -791,7 +821,8 @@ func TestRemoteWriteHandler_V2Message(t *testing.T) {
 					}
 				}
 				if tc.appendMetadata && tc.updateMetadataErr == nil {
-					expectedMeta := ts.ToMetadata(writeV2RequestFixture.Symbols)
+					expectedMeta, err := ts.ToMetadata(writeV2RequestFixture.Symbols)
+					require.NoError(t, err)
 					requireEqual(t, mockMetadata{ls, expectedMeta}, appendable.metadata[m])
 					m++
 				}
@@ -1048,7 +1079,7 @@ func BenchmarkRemoteWriteHandler(b *testing.B) {
 			payloadFunc: func() ([]byte, error) {
 				buf, _, _, err := buildV2WriteRequest(promslog.NewNopLogger(), []writev2.TimeSeries{{
 					LabelsRefs: []uint32{0, 1, 2, 3},
-					Histograms: []writev2.Histogram{writev2.FromIntHistogram(0, &testHistogram)},
+					Histograms: []writev2.Histogram{writev2.FromIntHistogram(0, 0, &testHistogram)},
 				}}, labelStrings,
 					nil, nil, nil, "snappy")
 				return buf, err
@@ -1164,7 +1195,7 @@ func TestHistogramValidationErrorHandling(t *testing.T) {
 					st := writev2.NewSymbolTable()
 					ts := []writev2.TimeSeries{{
 						LabelsRefs: st.SymbolizeLabels(labels.FromStrings("__name__", "test"), nil),
-						Histograms: []writev2.Histogram{writev2.FromIntHistogram(1, &tc.hist)},
+						Histograms: []writev2.Histogram{writev2.FromIntHistogram(0, 1, &tc.hist)},
 					}}
 					buf, _, _, err = buildV2WriteRequest(promslog.NewNopLogger(), ts, st.Symbols(), nil, nil, nil, "snappy")
 				}
@@ -1267,6 +1298,7 @@ func genSeriesWithSample(numSeries int, ts int64) []prompb.TimeSeries {
 	return series
 }
 
+// TODO(bwplotka): Delete and switch all to teststorage.Appendable.
 type mockAppendable struct {
 	latestSample    map[uint64]int64
 	samples         []mockSample
@@ -1575,11 +1607,11 @@ func TestHistogramsReduction(t *testing.T) {
 				payload, _, _, err = buildV2WriteRequest(promslog.NewNopLogger(), []writev2.TimeSeries{
 					{
 						LabelsRefs: []uint32{0, 1},
-						Histograms: []writev2.Histogram{writev2.FromIntHistogram(1, highSchemaHistogram)},
+						Histograms: []writev2.Histogram{writev2.FromIntHistogram(0, 1, highSchemaHistogram)},
 					},
 					{
 						LabelsRefs: []uint32{0, 2},
-						Histograms: []writev2.Histogram{writev2.FromFloatHistogram(2, highSchemaHistogram.ToFloat(nil))},
+						Histograms: []writev2.Histogram{writev2.FromFloatHistogram(0, 2, highSchemaHistogram.ToFloat(nil))},
 					},
 				}, []string{"__name__", "test_metric1", "test_metric2"},
 					nil, nil, nil, "snappy")

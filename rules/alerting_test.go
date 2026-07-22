@@ -16,6 +16,7 @@ package rules
 import (
 	"context"
 	"errors"
+	"runtime"
 	"testing"
 	"time"
 
@@ -115,7 +116,7 @@ func TestAlertingRuleTemplateWithHistogram(t *testing.T) {
 		return []promql.Sample{{H: &h}}, nil
 	}
 
-	expr, err := parser.ParseExpr("foo")
+	expr, err := testParser.ParseExpr("foo")
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -159,7 +160,7 @@ func TestAlertingRuleLabelsUpdate(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 85 70 70 stale
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests < 100`)
+	expr, err := testParser.ParseExpr(`http_requests < 100`)
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -264,7 +265,7 @@ func TestAlertingRuleExternalLabelsInTemplate(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 85 70 70
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests < 100`)
+	expr, err := testParser.ParseExpr(`http_requests < 100`)
 	require.NoError(t, err)
 
 	ruleWithoutExternalLabels := NewAlertingRule(
@@ -358,7 +359,7 @@ func TestAlertingRuleExternalURLInTemplate(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 85 70 70
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests < 100`)
+	expr, err := testParser.ParseExpr(`http_requests < 100`)
 	require.NoError(t, err)
 
 	ruleWithoutExternalURL := NewAlertingRule(
@@ -452,7 +453,7 @@ func TestAlertingRuleEmptyLabelFromTemplate(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 85 70 70
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests < 100`)
+	expr, err := testParser.ParseExpr(`http_requests < 100`)
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -507,7 +508,7 @@ func TestAlertingRuleQueryInTemplate(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	70 85 70 70
 	`)
 
-	expr, err := parser.ParseExpr(`sum(http_requests) < 100`)
+	expr, err := testParser.ParseExpr(`sum(http_requests) < 100`)
 	require.NoError(t, err)
 
 	ruleWithQueryInTemplate := NewAlertingRule(
@@ -538,8 +539,11 @@ instance: {{ $v.Labels.instance }}, value: {{ printf "%.0f" $v.Value }};
 			close(startQueryCh)
 			select {
 			case <-getDoneCh:
-			case <-time.After(time.Millisecond * 10):
+			case <-time.After(20 * time.Millisecond):
 				// Assert no blocking when template expanding.
+				buf := make([]byte, 1<<20)
+				n := runtime.Stack(buf, true)
+				t.Logf("goroutine dump:\n%s", buf[:n])
 				require.Fail(t, "unexpected blocking when template expanding.")
 			}
 		}
@@ -592,7 +596,7 @@ func TestAlertingRuleDuplicate(t *testing.T) {
 
 	now := time.Now()
 
-	expr, _ := parser.ParseExpr(`vector(0) or label_replace(vector(0),"test","x","","")`)
+	expr, _ := testParser.ParseExpr(`vector(0) or label_replace(vector(0),"test","x","","")`)
 	rule := NewAlertingRule(
 		"foo",
 		expr,
@@ -635,7 +639,7 @@ func TestAlertingRuleLimit(t *testing.T) {
 		},
 	}
 
-	expr, _ := parser.ParseExpr(`metric > 0`)
+	expr, _ := testParser.ParseExpr(`metric > 0`)
 	rule := NewAlertingRule(
 		"foo",
 		expr,
@@ -741,6 +745,45 @@ func TestQueryForStateSeries(t *testing.T) {
 	}
 }
 
+// TestQueryForStateSeriesTemplateLabels verifies that labels containing Go
+// template syntax are excluded from the matchers used to query ALERTS_FOR_STATE,
+// so that per-instance expanded values stored in the series can still be found.
+func TestQueryForStateSeriesTemplateLabels(t *testing.T) {
+	var gotMatchers []*labels.Matcher
+	querier := &storage.MockQuerier{
+		SelectMockFunction: func(_ bool, _ *storage.SelectHints, matchers ...*labels.Matcher) storage.SeriesSet {
+			gotMatchers = matchers
+			return storage.EmptySeriesSet()
+		},
+	}
+
+	rule := NewAlertingRule(
+		"TestRule",
+		nil,
+		time.Minute,
+		0,
+		labels.FromStrings("severity", "critical", "instance_ext", "instance_{{ $labels.instance }}"),
+		labels.EmptyLabels(), labels.EmptyLabels(), "", true, nil,
+	)
+
+	_, err := rule.QueryForStateSeries(context.Background(), querier)
+	require.NoError(t, err)
+
+	for _, m := range gotMatchers {
+		require.NotContains(t, m.Value, "{{", "template label %q must not appear in Select matchers", m.Name)
+	}
+
+	// The static label must still be present.
+	found := false
+	for _, m := range gotMatchers {
+		if m.Name == "severity" && m.Value == "critical" {
+			found = true
+			break
+		}
+	}
+	require.True(t, found, "static label severity=critical must be present in Select matchers")
+}
+
 // TestSendAlertsDontAffectActiveAlerts tests a fix for https://github.com/prometheus/prometheus/issues/11424.
 func TestSendAlertsDontAffectActiveAlerts(t *testing.T) {
 	rule := NewAlertingRule(
@@ -758,7 +801,7 @@ func TestSendAlertsDontAffectActiveAlerts(t *testing.T) {
 	al := &Alert{State: StateFiring, Labels: lbls, ActiveAt: time.Now()}
 	rule.active[h] = al
 
-	expr, err := parser.ParseExpr("foo")
+	expr, err := testParser.ParseExpr("foo")
 	require.NoError(t, err)
 	rule.vector = expr
 
@@ -799,7 +842,7 @@ func TestKeepFiringFor(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 85 70 70 10x5
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests > 50`)
+	expr, err := testParser.ParseExpr(`http_requests > 50`)
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -909,7 +952,7 @@ func TestPendingAndKeepFiringFor(t *testing.T) {
 			http_requests{job="app-server", instance="0"}	75 10x10
 	`)
 
-	expr, err := parser.ParseExpr(`http_requests > 50`)
+	expr, err := testParser.ParseExpr(`http_requests > 50`)
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -969,7 +1012,7 @@ func TestAlertingEvalWithOrigin(t *testing.T) {
 		lbs    = labels.FromStrings("test", "test")
 	)
 
-	expr, err := parser.ParseExpr(query)
+	expr, err := testParser.ParseExpr(query)
 	require.NoError(t, err)
 
 	rule := NewAlertingRule(
@@ -1062,4 +1105,86 @@ func TestAlertingRule_ActiveAlertsCount(t *testing.T) {
 	rule.active[h] = al
 
 	require.Equal(t, 1, rule.ActiveAlertsCount())
+}
+
+// TestFiringAlertResetToPendingOnHoldDurationIncrease verifies that when the
+// holdDuration ("for" duration) is increased on a rule that already has a
+// firing alert, the alert is demoted back to StatePending because the elapsed
+// time since ActiveAt no longer meets the new, larger holdDuration.
+func TestFiringAlertResetToPendingOnHoldDurationIncrease(t *testing.T) {
+	shortHold := 15 * time.Second
+	longHold := 1 * time.Hour
+
+	expr, err := testParser.ParseExpr("foo")
+	require.NoError(t, err)
+
+	rule := NewAlertingRule(
+		"TestResetToPending",
+		expr,
+		shortHold,
+		0,
+		labels.EmptyLabels(),
+		labels.EmptyLabels(), labels.EmptyLabels(), "", true, nil,
+	)
+
+	baseTime := time.Unix(0, 0)
+	q := func(_ context.Context, _ string, ts time.Time) (promql.Vector, error) {
+		return promql.Vector{
+			promql.Sample{
+				Metric: labels.EmptyLabels(),
+				T:      timestamp.FromTime(ts),
+				F:      1,
+			},
+		}, nil
+	}
+
+	// Eval at t=0: creates the alert in StatePending with ActiveAt = baseTime.
+	_, err = rule.Eval(context.TODO(), 0, baseTime, q, nil, 0)
+	require.NoError(t, err)
+
+	require.Len(t, rule.active, 1)
+	var alert *Alert
+	for _, a := range rule.active {
+		alert = a
+	}
+	require.Equal(t, StatePending, alert.State)
+
+	// Eval at t=15s: the short holdDuration is met, alert transitions to firing.
+	evalTime := baseTime.Add(shortHold)
+	_, err = rule.Eval(context.TODO(), 0, evalTime, q, nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, StateFiring, alert.State)
+	require.False(t, alert.FiredAt.IsZero(), "FiredAt should be set after firing")
+
+	// Now increase the holdDuration to 1 hour (simulating a rule config reload).
+	rule.holdDuration = longHold
+
+	// Eval at t=30s: only 30s have elapsed since ActiveAt, which is far less
+	// than the new 1h holdDuration, so the alert must go back to pending.
+	evalTime = baseTime.Add(30 * time.Second)
+	res, err := rule.Eval(context.TODO(), 0, evalTime, q, nil, 0)
+	require.NoError(t, err)
+
+	require.Equal(t, StatePending, alert.State)
+	require.True(t, alert.FiredAt.IsZero(), "FiredAt should be reset")
+	require.True(t, alert.LastSentAt.IsZero(), "LastSentAt should be reset")
+	require.True(t, alert.KeepFiringSince.IsZero(), "KeepFiringSince should be reset")
+
+	for _, smpl := range res {
+		if smpl.Metric.Get("__name__") == "ALERTS" {
+			require.Equal(t, "pending", smpl.Metric.Get("alertstate"))
+		}
+	}
+
+	// Eval at t=1h: now the new holdDuration is met, alert fires again.
+	evalTime = baseTime.Add(longHold)
+	res, err = rule.Eval(context.TODO(), 0, evalTime, q, nil, 0)
+	require.NoError(t, err)
+	require.Equal(t, StateFiring, alert.State)
+
+	for _, smpl := range res {
+		if smpl.Metric.Get("__name__") == "ALERTS" {
+			require.Equal(t, "firing", smpl.Metric.Get("alertstate"))
+		}
+	}
 }

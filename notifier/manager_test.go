@@ -26,6 +26,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -43,7 +44,6 @@ import (
 	"github.com/prometheus/prometheus/discovery/targetgroup"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
-	"github.com/prometheus/prometheus/util/testutil/synctest"
 )
 
 func alertsEqual(a, b []*Alert) error {
@@ -745,8 +745,13 @@ func TestHangingNotifier(t *testing.T) {
 		ctx, cancelSdManager := context.WithCancel(t.Context())
 		defer cancelSdManager()
 		reg := prometheus.NewRegistry()
-		sdMetrics, err := discovery.RegisterSDMetrics(reg, discovery.NewRefreshMetrics(reg))
+		refreshMetrics := discovery.NewRefreshMetrics(reg)
+		mechanismMetrics, err := discovery.RegisterSDMetrics(reg, refreshMetrics)
 		require.NoError(t, err)
+		sdMetrics := &discovery.SDMetrics{
+			MechanismMetrics: mechanismMetrics,
+			RefreshManager:   refreshMetrics,
+		}
 		sdManager := discovery.NewManager(
 			ctx,
 			promslog.NewNopLogger(),
@@ -1120,6 +1125,77 @@ alerting:
 
 	require.NoError(t, n.ApplyConfig(cfg))
 	require.Empty(t, n.Alertmanagers())
+}
+
+// TestManagerClosedTargetSetsChannel checks that the manager copes with the discovery
+// manager closing the target sets channel on shutdown: the target update loop stops
+// instead of busy-spinning on the closed channel, while Run keeps going until Stop is
+// called.
+func TestManagerClosedTargetSetsChannel(t *testing.T) {
+	t.Run("target update loop returns", func(t *testing.T) {
+		m := NewManager(&Options{}, model.UTF8Validation, nil)
+		defer m.Stop()
+
+		tsets := make(chan map[string][]*targetgroup.Group)
+		loopDone := make(chan struct{})
+		go func() {
+			m.targetUpdateLoop(tsets)
+			close(loopDone)
+		}()
+		close(tsets)
+
+		select {
+		case <-loopDone:
+		case <-time.After(5 * time.Second):
+			t.Fatal("target update loop did not stop after the target sets channel was closed")
+		}
+	})
+
+	t.Run("Run waits for Stop", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			m := NewManager(&Options{}, model.UTF8Validation, nil)
+			defer m.Stop()
+
+			amCfg := config.DefaultAlertmanagerConfig
+			ams := newTestAlertmanagerSet(&amCfg, nil, m.opts, m.metrics, "http://alertmanager:9093/api/v2/alerts")
+			m.alertmanagers = map[string]*alertmanagerSet{"test": ams}
+			ams.startSendLoops(ams.ams)
+
+			tsets := make(chan map[string][]*targetgroup.Group)
+			runDone := make(chan struct{})
+			go func() {
+				m.Run(tsets)
+				close(runDone)
+			}()
+			close(tsets)
+			synctest.Wait()
+
+			// Notifications must still be sent while rule evaluation finishes, so Run may
+			// only return, and clean up the send loops, once Stop has been called.
+			select {
+			case <-runDone:
+				t.Fatal("Run returned before Stop was called")
+			default:
+			}
+			ams.mtx.RLock()
+			sendLoops := len(ams.sendLoops)
+			ams.mtx.RUnlock()
+			require.Equal(t, 1, sendLoops, "send loop was cleaned up before Stop was called")
+
+			m.Stop()
+			synctest.Wait()
+
+			select {
+			case <-runDone:
+			default:
+				t.Fatal("Run did not return after Stop was called")
+			}
+			ams.mtx.RLock()
+			sendLoops = len(ams.sendLoops)
+			ams.mtx.RUnlock()
+			require.Zero(t, sendLoops, "send loop was not cleaned up after Stop was called")
+		})
+	})
 }
 
 // TestAlerstRelabelingIsIsolated ensures that a mutation alerts relabeling in an

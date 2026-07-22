@@ -50,6 +50,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/features"
+	"github.com/prometheus/prometheus/util/kahansum"
 	"github.com/prometheus/prometheus/util/logging"
 	"github.com/prometheus/prometheus/util/stats"
 	"github.com/prometheus/prometheus/util/zeropool"
@@ -90,6 +91,7 @@ type engineMetrics struct {
 	queryResultSort           prometheus.Observer
 	queryResultSortHistogram  prometheus.Observer
 	querySamples              prometheus.Counter
+	querySamplesRead          prometheus.Counter
 }
 
 type (
@@ -332,8 +334,14 @@ type EngineOpts struct {
 	// EnableTypeAndUnitLabels will allow PromQL Engine to make decisions based on the type and unit labels.
 	EnableTypeAndUnitLabels bool
 
+	// UseStartTimestamps enables start timestamp usage in functions such as rate().
+	UseStartTimestamps bool
+
 	// FeatureRegistry is the registry for tracking enabled/disabled features.
 	FeatureRegistry features.Collector
+
+	// Parser is the PromQL parser instance used for parsing expressions.
+	Parser parser.Parser
 }
 
 // Engine handles the lifetime of queries from beginning to end.
@@ -353,6 +361,8 @@ type Engine struct {
 	enablePerStepStats       bool
 	enableDelayedNameRemoval bool
 	enableTypeAndUnitLabels  bool
+	useStartTimestamps       bool
+	parser                   parser.Parser
 }
 
 // NewEngine returns a new engine.
@@ -413,7 +423,13 @@ func NewEngine(opts EngineOpts) *Engine {
 			Namespace: namespace,
 			Subsystem: subsystem,
 			Name:      "query_samples_total",
-			Help:      "The total number of samples loaded by all queries.",
+			Help:      "The total number of samples loaded by all queries (full window per step for range-vector).",
+		}),
+		querySamplesRead: prometheus.NewCounter(prometheus.CounterOpts{
+			Namespace: namespace,
+			Subsystem: subsystem,
+			Name:      "query_samples_read_total",
+			Help:      "The total number of samples read by all queries (only new points per step for range-vector).",
 		}),
 		queryQueueTime:            queryResultSummary.WithLabelValues("queue_time"),
 		queryQueueTimeHistogram:   queryResultHistogram.WithLabelValues("queue_time"),
@@ -431,6 +447,10 @@ func NewEngine(opts EngineOpts) *Engine {
 		metrics.maxConcurrentQueries.Set(-1)
 	}
 
+	if opts.Parser == nil {
+		opts.Parser = parser.NewParser(parser.Options{})
+	}
+
 	if opts.LookbackDelta == 0 {
 		opts.LookbackDelta = defaultLookbackDelta
 		if l := opts.Logger; l != nil {
@@ -445,6 +465,7 @@ func NewEngine(opts EngineOpts) *Engine {
 			metrics.queryLogEnabled,
 			metrics.queryLogFailures,
 			metrics.querySamples,
+			metrics.querySamplesRead,
 			queryResultSummary,
 			queryResultHistogram,
 		)
@@ -459,7 +480,9 @@ func NewEngine(opts EngineOpts) *Engine {
 		r.Enable(features.PromQL, "per_query_lookback_delta")
 		r.Enable(features.PromQL, "subqueries")
 
-		parser.RegisterFeatures(r)
+		if opts.Parser != nil {
+			opts.Parser.RegisterFeatures(r)
+		}
 	}
 
 	return &Engine{
@@ -475,6 +498,8 @@ func NewEngine(opts EngineOpts) *Engine {
 		enablePerStepStats:       opts.EnablePerStepStats,
 		enableDelayedNameRemoval: opts.EnableDelayedNameRemoval,
 		enableTypeAndUnitLabels:  opts.EnableTypeAndUnitLabels,
+		useStartTimestamps:       opts.UseStartTimestamps,
+		parser:                   opts.Parser,
 	}
 }
 
@@ -523,7 +548,7 @@ func (ng *Engine) NewInstantQuery(ctx context.Context, q storage.Queryable, opts
 		return nil, err
 	}
 	defer finishQueue()
-	expr, err := parser.ParseExpr(qs)
+	expr, err := ng.parser.ParseExpr(qs)
 	if err != nil {
 		return nil, err
 	}
@@ -544,7 +569,7 @@ func (ng *Engine) NewRangeQuery(ctx context.Context, q storage.Queryable, opts Q
 		return nil, err
 	}
 	defer finishQueue()
-	expr, err := parser.ParseExpr(qs)
+	expr, err := ng.parser.ParseExpr(qs)
 	if err != nil {
 		return nil, err
 	}
@@ -663,6 +688,7 @@ func (ng *Engine) exec(ctx context.Context, q *query) (v parser.Value, ws annota
 	defer func() {
 		ng.metrics.currentQueries.Dec()
 		ng.metrics.querySamples.Add(float64(q.sampleStats.TotalSamples))
+		ng.metrics.querySamplesRead.Add(float64(q.sampleStats.SamplesRead))
 	}()
 
 	ctx, cancel := context.WithTimeout(ctx, ng.timeout)
@@ -688,7 +714,11 @@ func (ng *Engine) exec(ctx context.Context, q *query) (v parser.Value, ws annota
 			}
 			f = append(f, slog.Any("stats", stats.NewQueryStats(q.Stats())))
 			if span := trace.SpanFromContext(ctx); span != nil {
-				f = append(f, slog.Any("spanID", span.SpanContext().SpanID()))
+				spanCtx := span.SpanContext()
+				f = append(f,
+					slog.Any("spanID", spanCtx.SpanID()),
+					slog.Any("traceID", spanCtx.TraceID()),
+				)
 			}
 			if origin := ctx.Value(QueryOrigin{}); origin != nil {
 				for k, v := range origin.(map[string]any) {
@@ -785,6 +815,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 			noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
 			enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
 			enableTypeAndUnitLabels:  ng.enableTypeAndUnitLabels,
+			useStartTimestamps:       ng.useStartTimestamps,
 			querier:                  querier,
 		}
 		query.sampleStats.InitStepTracking(start, start, 1)
@@ -845,6 +876,7 @@ func (ng *Engine) execEvalStmt(ctx context.Context, query *query, s *parser.Eval
 		noStepSubqueryIntervalFn: ng.noStepSubqueryIntervalFn,
 		enableDelayedNameRemoval: ng.enableDelayedNameRemoval,
 		enableTypeAndUnitLabels:  ng.enableTypeAndUnitLabels,
+		useStartTimestamps:       ng.useStartTimestamps,
 		querier:                  querier,
 	}
 	query.sampleStats.InitStepTracking(evaluator.startTimestamp, evaluator.endTimestamp, evaluator.interval)
@@ -1132,6 +1164,7 @@ type evaluator struct {
 	noStepSubqueryIntervalFn func(rangeMillis int64) int64
 	enableDelayedNameRemoval bool
 	enableTypeAndUnitLabels  bool
+	useStartTimestamps       bool
 	querier                  storage.Querier
 }
 
@@ -1202,22 +1235,68 @@ type EvalNodeHelper struct {
 	// funcHistogramQuantile and funcHistogramFraction for classic histograms.
 	signatureToMetricWithBuckets map[string]*metricWithBuckets
 	nativeHistogramSamples       []Sample
+	// funcHistogramQuantiles for histograms.
+	quantileStrs                  map[float64]string
+	signatureToLabelsWithQuantile map[string]map[float64]labels.Labels
 
 	lb           *labels.Builder
 	lblBuf       []byte
 	lblResultBuf []byte
 
 	// For binary vector matching.
-	rightSigs    map[int]Sample
-	matchedSigs  map[int]map[uint64]struct{}
-	resultMetric map[string]labels.Labels
-	numSigs      int
+	rightSigs          []Sample
+	sigsPresent        []bool
+	matchedSigs        []map[uint64]struct{}
+	matchedSigsPresent []bool
+	resultMetric       map[string]labels.Labels
+	numSigs            int
 
 	// For info series matching.
 	rightStrSigs map[string]Sample
 
 	// Additional options for the evaluation.
 	enableDelayedNameRemoval bool
+
+	// StartTimestamps optionally provides sample start timestamps aligned with matrix samples.
+	StartTimestamps *StartTimestamps
+}
+
+func (enh *EvalNodeHelper) resetSigsPresent() []bool {
+	if len(enh.sigsPresent) == 0 {
+		enh.sigsPresent = make([]bool, enh.numSigs)
+	} else {
+		clear(enh.sigsPresent)
+	}
+	return enh.sigsPresent
+}
+
+func (enh *EvalNodeHelper) resetMatchedSigsPresent() []bool {
+	if len(enh.matchedSigsPresent) == 0 {
+		enh.matchedSigsPresent = make([]bool, enh.numSigs)
+	} else {
+		clear(enh.matchedSigsPresent)
+	}
+	return enh.matchedSigsPresent
+}
+
+func (enh *EvalNodeHelper) resetRightSigs() []Sample {
+	if enh.rightSigs == nil {
+		enh.rightSigs = make([]Sample, enh.numSigs)
+	} else {
+		clear(enh.rightSigs)
+	}
+	return enh.rightSigs
+}
+
+func (enh *EvalNodeHelper) resetMatchedSigs() []map[uint64]struct{} {
+	if enh.matchedSigs == nil {
+		enh.matchedSigs = make([]map[uint64]struct{}, enh.numSigs)
+	} else {
+		for i := range enh.matchedSigs {
+			clear(enh.matchedSigs[i])
+		}
+	}
+	return enh.matchedSigs
 }
 
 func (enh *EvalNodeHelper) resetBuilder(lbls labels.Labels) {
@@ -1293,6 +1372,35 @@ func (enh *EvalNodeHelper) resetHistograms(inVec Vector, arg parser.Expr) annota
 	return annos
 }
 
+func (enh *EvalNodeHelper) getOrCreateLblsWithQuantile(lbls labels.Labels, quantileLabel string, q float64) labels.Labels {
+	if enh.signatureToLabelsWithQuantile == nil {
+		enh.signatureToLabelsWithQuantile = make(map[string]map[float64]labels.Labels)
+	}
+
+	enh.lblBuf = lbls.Bytes(enh.lblBuf)
+	cachedLbls, ok := enh.signatureToLabelsWithQuantile[string(enh.lblBuf)]
+	if !ok {
+		cachedLbls = make(map[float64]labels.Labels, len(enh.quantileStrs))
+		enh.signatureToLabelsWithQuantile[string(enh.lblBuf)] = cachedLbls
+	}
+
+	cachedLblsWithQuantile, ok := cachedLbls[q]
+	if !ok {
+		quantileStr := "NaN"
+		if !math.IsNaN(q) {
+			// Cannot do map lookup by NaN key.
+			quantileStr = enh.quantileStrs[q]
+		}
+		cachedLblsWithQuantile = labels.NewBuilder(lbls).
+			Set(quantileLabel, quantileStr).
+			Labels()
+
+		cachedLbls[q] = cachedLblsWithQuantile
+	}
+
+	return cachedLblsWithQuantile
+}
+
 // rangeEval evaluates the given expressions, and then for each step calls
 // the given funcCall with the values computed for each expression at that
 // step. The return value is the combination into time series of all the
@@ -1309,17 +1417,18 @@ func (ev *evaluator) rangeEval(ctx context.Context, matching *parser.VectorMatch
 	var warnings annotations.Annotations
 	for i, e := range exprs {
 		// Functions will take string arguments from the expressions, not the values.
-		if e != nil && e.Type() != parser.ValueTypeString {
-			// ev.currentSamples will be updated to the correct value within the ev.eval call.
-			val, ws := ev.eval(ctx, e)
-			warnings.Merge(ws)
-			matrixes[i] = val.(Matrix)
-
-			// Keep a copy of the original point slices so that they
-			// can be returned to the pool.
-			origMatrixes[i] = make(Matrix, len(matrixes[i]))
-			copy(origMatrixes[i], matrixes[i])
+		if e == nil || e.Type() == parser.ValueTypeString {
+			continue
 		}
+		// ev.currentSamples will be updated to the correct value within the ev.eval call.
+		val, ws := ev.eval(ctx, e)
+		warnings.Merge(ws)
+		matrixes[i] = val.(Matrix)
+
+		// Keep a copy of the original point slices so that they
+		// can be returned to the pool.
+		origMatrixes[i] = make(Matrix, len(matrixes[i]))
+		copy(origMatrixes[i], matrixes[i])
 	}
 
 	vectors := make([]Vector, len(exprs)) // Input vectors for the function.
@@ -1618,19 +1727,18 @@ func (ev *evaluator) rangeEvalAgg(ctx context.Context, aggExpr *parser.Aggregate
 
 // smoothSeries is a helper function that smooths the series by interpolating the values
 // based on values before and after the timestamp.
-func (ev *evaluator) smoothSeries(series []storage.Series, offset time.Duration) Matrix {
+func (ev *evaluator) smoothSeries(series []storage.Series, offset time.Duration, pos posrange.PositionRange) (Matrix, annotations.Annotations) {
 	dur := ev.endTimestamp - ev.startTimestamp
 
 	it := storage.NewBuffer(dur + 2*durationMilliseconds(ev.lookbackDelta))
 
 	offMS := offset.Milliseconds()
-	start := ev.startTimestamp - offMS
-	end := ev.endTimestamp - offMS
 	step := ev.interval
 	lb := durationMilliseconds(ev.lookbackDelta)
 
 	var chkIter chunkenc.Iterator
 	mat := make(Matrix, 0, len(series))
+	var annos annotations.Annotations
 
 	for _, s := range series {
 		ss := Series{Metric: s.Labels()}
@@ -1640,50 +1748,95 @@ func (ev *evaluator) smoothSeries(series []storage.Series, offset time.Duration)
 
 		var floats []FPoint
 		var hists []HPoint
+		metricName := s.Labels().Get(labels.MetricName)
 
-		for ts := start; ts <= end; ts += step {
-			matrixStart := ts - lb
-			matrixEnd := ts + lb
+		for evalTS := ev.startTimestamp; evalTS <= ev.endTimestamp; evalTS += step {
+			// Apply offset to get the data timestamp.
+			dataTS := evalTS - offMS
+			matrixStart := dataTS - lb
+			matrixEnd := dataTS + lb
 
-			floats, hists = ev.matrixIterSlice(it, matrixStart, matrixEnd, floats, hists)
+			floats, hists, _ = ev.matrixIterSlice(it, matrixStart, matrixEnd, floats, hists, nil)
 			if len(floats) == 0 && len(hists) == 0 {
 				continue
 			}
 
-			if len(hists) > 0 {
-				// TODO: support native histograms.
-				ev.errorf("smoothed and anchored modifiers do not work with native histograms")
+			if len(hists) > 0 && len(floats) > 0 {
+				annos.Add(annotations.NewMixedFloatsHistogramsWarning(metricName, pos))
+				continue
 			}
 
-			// Binary search for the first index with T >= ts.
-			i := sort.Search(len(floats), func(i int) bool { return floats[i].T >= ts })
+			if len(hists) > 0 {
+				// Binary search for the first histogram index with T >= dataTS.
+				i := sort.Search(len(hists), func(i int) bool { return hists[i].T >= dataTS })
 
-			switch {
-			case i < len(floats) && floats[i].T == ts:
-				// Exact match.
-				ss.Floats = append(ss.Floats, floats[i])
+				switch {
+				case i < len(hists) && hists[i].T == dataTS:
+					// Exact match.
+					ss.Histograms = append(ss.Histograms, HPoint{H: hists[i].H.Copy(), T: evalTS})
 
-			case i > 0 && i < len(floats):
-				// Interpolate between prev and next.
-				// TODO: detect if the sample is a counter, based on __type__ or metadata.
-				prev, next := floats[i-1], floats[i]
-				val := interpolate(prev, next, ts, false, false)
-				ss.Floats = append(ss.Floats, FPoint{F: val, T: ts})
+				case i > 0 && i < len(hists):
+					// Interpolate between prev and next.
+					// Use CounterResetHint to determine counter vs gauge: treat as counter
+					// unless both samples explicitly carry the gauge hint.
+					prev, next := hists[i-1], hists[i]
+					if prev.H.UsesCustomBuckets() != next.H.UsesCustomBuckets() {
+						annos.Add(annotations.NewMixedExponentialCustomHistogramsWarning(metricName, pos))
+						continue
+					}
+					isCounter := prev.H.CounterResetHint != histogram.GaugeType || next.H.CounterResetHint != histogram.GaugeType
+					h, err := interpolateHistograms(prev.H, prev.T, next.H, next.T, dataTS, isCounter, &annos, pos)
+					if err != nil {
+						annosFromInterpolationError(&annos, err, metricName, pos)
+						continue
+					}
+					ss.Histograms = append(ss.Histograms, HPoint{H: h, T: evalTS})
 
-			case i > 0:
-				// No next point yet; carry forward previous value.
-				prev := floats[i-1]
-				ss.Floats = append(ss.Floats, FPoint{F: prev.F, T: ts})
+				case i > 0:
+					// No next point yet; carry forward previous value.
+					// CounterResetHint is reset to UnknownCounterReset because the hint
+					// describes the relationship between consecutive samples, not the value.
+					prev := hists[i-1]
+					h := prev.H.Copy()
+					h.CounterResetHint = histogram.UnknownCounterReset
+					ss.Histograms = append(ss.Histograms, HPoint{H: h, T: evalTS})
 
-			default:
-				// i == 0 and floats[0].T > ts: there is no previous data yet; skip.
+				default:
+					// i == 0 and hists[0].T > dataTS: there is no previous data yet; skip.
+				}
+			} else {
+				// Binary search for the first index with T >= dataTS.
+				i := sort.Search(len(floats), func(i int) bool { return floats[i].T >= dataTS })
+
+				switch {
+				case i < len(floats) && floats[i].T == dataTS:
+					// Exact match.
+					ss.Floats = append(ss.Floats, FPoint{F: floats[i].F, T: evalTS})
+
+				case i > 0 && i < len(floats):
+					// Interpolate between prev and next.
+					// TODO: detect if the sample is a counter, based on __type__ or metadata.
+					prev, next := floats[i-1], floats[i]
+					val := interpolate(prev, next, dataTS, false)
+					ss.Floats = append(ss.Floats, FPoint{F: val, T: evalTS})
+
+				case i > 0:
+					// No next point yet; carry forward previous value.
+					prev := floats[i-1]
+					ss.Floats = append(ss.Floats, FPoint{F: prev.F, T: evalTS})
+
+				default:
+					// i == 0 and floats[0].T > dataTS: there is no previous data yet; skip.
+				}
 			}
 		}
 
-		mat = append(mat, ss)
+		if len(ss.Floats)+len(ss.Histograms) > 0 {
+			mat = append(mat, ss)
+		}
 	}
 
-	return mat
+	return mat, annos
 }
 
 // evalSeries generates a Matrix between ev.startTimestamp and ev.endTimestamp (inclusive), each point spaced ev.interval apart, from series given offset.
@@ -1710,7 +1863,7 @@ func (ev *evaluator) evalSeries(ctx context.Context, series []storage.Series, of
 
 		for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
 			step++
-			origT, f, h, ok := ev.vectorSelectorSingle(it, offset, ts)
+			_, origT, f, h, ok := ev.vectorSelectorSingle(it, offset, ts)
 			if !ok {
 				continue
 			}
@@ -1718,6 +1871,7 @@ func (ev *evaluator) evalSeries(ctx context.Context, series []storage.Series, of
 			if h == nil {
 				ev.currentSamples++
 				ev.samplesStats.IncrementSamplesAtStep(step, 1)
+				ev.samplesStats.IncrementSamplesReadAtStep(step, 1)
 				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
@@ -1740,6 +1894,7 @@ func (ev *evaluator) evalSeries(ctx context.Context, series []storage.Series, of
 				histSize := point.size()
 				ev.currentSamples += histSize
 				ev.samplesStats.IncrementSamplesAtStep(step, int64(histSize))
+				ev.samplesStats.IncrementSamplesReadAtStep(step, int64(histSize))
 				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
@@ -1759,16 +1914,95 @@ func (ev *evaluator) evalSeries(ctx context.Context, series []storage.Series, of
 	return mat
 }
 
+// numSteps returns the number of steps in the evaluator's range,
+// treating an instant query (interval == 0) as a single step.
+func (ev *evaluator) numSteps() int {
+	if ev.interval <= 0 {
+		return 1
+	}
+	return int((ev.endTimestamp-ev.startTimestamp)/ev.interval) + 1
+}
+
+// runSubquery evaluates the given SubqueryExpr in a fresh child evaluator
+// aligned to the subquery's own step grid and returns the result along with
+// the child's samples stats. The caller decides how to merge the child stats
+// into the parent: peak and samples-read are always safe to absorb, while
+// TotalSamples should only be absorbed when the caller does not later
+// re-count the materialized matrix (e.g. evalSubquery does not absorb it).
+func (ev *evaluator) runSubquery(ctx context.Context, e *parser.SubqueryExpr) (parser.Value, *stats.QuerySamples, annotations.Annotations) {
+	offsetMillis := durationMilliseconds(e.Offset)
+	rangeMillis := durationMilliseconds(e.Range)
+
+	// Align the parent end timestamp down to the parent's step grid before
+	// applying the subquery offset, so the subquery does not evaluate past
+	// the parent's last actual evaluation point when the caller supplied
+	// an end timestamp that is not step-aligned.
+	parentEnd := ev.endTimestamp
+	if ev.interval > 0 {
+		parentEnd = ev.startTimestamp + ((ev.endTimestamp-ev.startTimestamp)/ev.interval)*ev.interval
+	}
+	subqEnd := parentEnd - offsetMillis
+
+	var subqInterval int64
+	if e.Step != 0 {
+		subqInterval = durationMilliseconds(e.Step)
+	} else {
+		subqInterval = ev.noStepSubqueryIntervalFn(rangeMillis)
+	}
+	subqStart := subqInterval * ((ev.startTimestamp - offsetMillis - rangeMillis) / subqInterval)
+	if subqStart <= (ev.startTimestamp - offsetMillis - rangeMillis) {
+		subqStart += subqInterval
+	}
+
+	// Subquery children always track per-step samples-read (independent of
+	// the parent's per-step setting) so MergeSamplesReadFromSubquery can
+	// attribute each subquery iteration to a parent step and drop iterations
+	// that fall in gaps between parent windows. The arrays don't escape this
+	// call.
+	childStats := stats.NewChildWithStepTracking(subqStart, subqEnd, subqInterval)
+	newEv := &evaluator{
+		startTimestamp:           subqStart,
+		endTimestamp:             subqEnd,
+		interval:                 subqInterval,
+		currentSamples:           ev.currentSamples,
+		maxSamples:               ev.maxSamples,
+		logger:                   ev.logger,
+		lookbackDelta:            ev.lookbackDelta,
+		samplesStats:             childStats,
+		noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
+		enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
+		enableTypeAndUnitLabels:  ev.enableTypeAndUnitLabels,
+		useStartTimestamps:       ev.useStartTimestamps,
+		querier:                  ev.querier,
+	}
+
+	if subqStart != ev.startTimestamp {
+		// Adjust the offset of selectors based on the new start time of
+		// the evaluator since the calculation of the offset with @ happens
+		// w.r.t. the start time.
+		setOffsetForAtModifier(subqStart, e.Expr)
+	}
+
+	res, ws := newEv.eval(ctx, e.Expr)
+	ev.currentSamples = newEv.currentSamples
+	return res, childStats, ws
+}
+
 // evalSubquery evaluates given SubqueryExpr and returns an equivalent
 // evaluated MatrixSelector in its place. Note that the Name and LabelMatchers are not set.
-func (ev *evaluator) evalSubquery(ctx context.Context, subq *parser.SubqueryExpr) (*parser.MatrixSelector, int, annotations.Annotations) {
-	samplesStats := ev.samplesStats
-	// Avoid double counting samples when running a subquery, those samples will be counted in later stage.
-	ev.samplesStats = ev.samplesStats.NewChild()
-	val, ws := ev.eval(ctx, subq)
-	// But do incorporate the peak from the subquery.
-	samplesStats.UpdatePeakFromSubquery(ev.samplesStats)
-	ev.samplesStats = samplesStats
+// Only PeakSamples and SamplesRead from the subquery are merged into the
+// parent; TotalSamples is intentionally not merged because the call/range-vector
+// caller will count samples again from the materialized matrix.
+//
+// outerOffset is durationMilliseconds(subq.OriginalOffset) so the merge can
+// shift child timestamps to match the parent step that consumes them.
+// outerRange is the outer call's selRange so the merge can drop subquery
+// iterations whose timestamps fall in gaps between consecutive outer-step
+// windows (i.e. when the outer step is wider than the subquery range).
+func (ev *evaluator) evalSubquery(ctx context.Context, subq *parser.SubqueryExpr, outerOffset, outerRange int64) (*parser.MatrixSelector, int, annotations.Annotations) {
+	val, childStats, ws := ev.runSubquery(ctx, subq)
+	ev.samplesStats.UpdatePeakFromSubquery(childStats)
+	ev.samplesStats.MergeSamplesReadFromSubquery(childStats, ev.startTimestamp, ev.interval, ev.numSteps(), outerOffset, outerRange)
 	mat := val.(Matrix)
 	vs := &parser.VectorSelector{
 		OriginalOffset: subq.OriginalOffset,
@@ -1873,22 +2107,21 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 
 	case *parser.Call:
 		call := FunctionCalls[e.Func.Name]
-		if e.Func.Name == "timestamp" {
+		if e.Func.Name == "timestamp" || e.Func.Name == "start_timestamp" {
 			// Matrix evaluation always returns the evaluation time,
 			// so this function needs special handling when given
 			// a vector selector.
-			arg := unwrapStepInvariantExpr(e.Args[0])
-			vs, ok := arg.(*parser.VectorSelector)
-			if ok {
+			if vs, ok := e.Args[0].(*parser.VectorSelector); ok {
 				return ev.rangeEvalTimestampFunctionOverVectorSelector(ctx, vs, call, e)
 			}
 		}
 
 		// Check if the function has a matrix argument.
 		var (
-			matrixArgIndex int
-			matrixArg      bool
-			warnings       annotations.Annotations
+			matrixArgIndex     int
+			matrixArg          bool
+			matrixFromSubquery bool
+			warnings           annotations.Annotations
 		)
 		for i := range e.Args {
 			a := e.Args[i]
@@ -1901,8 +2134,9 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			if subq, ok := a.(*parser.SubqueryExpr); ok {
 				matrixArgIndex = i
 				matrixArg = true
+				matrixFromSubquery = true
 				// Replacing parser.SubqueryExpr with parser.MatrixSelector.
-				val, totalSamples, ws := ev.evalSubquery(ctx, subq)
+				val, totalSamples, ws := ev.evalSubquery(ctx, subq, durationMilliseconds(subq.OriginalOffset), durationMilliseconds(subq.Range))
 				e.Args[i] = val
 				warnings.Merge(ws)
 				defer func() {
@@ -1922,6 +2156,16 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			return ev.evalLabelJoin(ctx, e.Args)
 		case "info":
 			return ev.evalInfo(ctx, e.Args)
+		}
+
+		// Functions with nil entries in FunctionCalls should have been handled before reaching this point.
+		if call == nil {
+			panic(fmt.Errorf("unexpected nil implementation for function %q", e.Func.Name))
+		}
+
+		// Emit a warning when sort is used for range queries.
+		if (e.Func.Name == "sort" || e.Func.Name == "sort_desc" || e.Func.Name == "sort_by_label" || e.Func.Name == "sort_by_label_desc") && ev.startTimestamp != ev.endTimestamp {
+			warnings.Add(annotations.NewSortInRangeQueryWarning(e.PositionRange()))
 		}
 
 		if !matrixArg {
@@ -1997,10 +2241,18 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 		it := storage.NewBuffer(bufferRange)
 		var chkIter chunkenc.Iterator
 
+		var startTimestamps *StartTimestamps
+		if ev.useStartTimestamps && (e.Func.Name == "rate" || e.Func.Name == "irate" || e.Func.Name == "increase" || e.Func.Name == "resets") {
+			// TODO: consider pooling this.
+			startTimestamps = &StartTimestamps{}
+		}
+
 		// The last_over_time and first_over_time functions act like
 		// offset; thus, they should keep the metric name.  For all the
 		// other range vector functions, the only change needed is to
 		// drop the metric name in the output.
+		// However, if the input series (e.g., from a subquery) already has
+		// DropName set, we should respect that.
 		dropName := (e.Func.Name != "last_over_time" && e.Func.Name != "first_over_time")
 		vectorVals := make([]Vector, len(e.Args)-1)
 		for i, s := range selVS.Series {
@@ -2014,15 +2266,28 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			if histograms != nil {
 				histograms = histograms[:0]
 			}
+			if startTimestamps != nil {
+				startTimestamps.Reset()
+			}
 			chkIter = s.Iterator(chkIter)
 			it.Reset(chkIter)
+
+			// Check if input series already wants to drop the name (e.g., from subquery).
+			inputDropName := false
+			if storageSeries, ok := s.(*StorageSeries); ok {
+				inputDropName = storageSeries.series.DropName
+			}
+
+			// Use OR logic: drop name if either the function wants it OR the input wants it.
+			seriesDropName := dropName || inputDropName
+
 			metric := selVS.Series[i].Labels()
-			if !ev.enableDelayedNameRemoval && dropName {
+			if !ev.enableDelayedNameRemoval && seriesDropName {
 				metric = metric.DropReserved(schema.IsMetadataLabel)
 			}
 			ss := Series{
 				Metric:   metric,
-				DropName: dropName,
+				DropName: seriesDropName,
 			}
 			inMatrix[0].Metric = selVS.Series[i].Labels()
 			for ts, step := ev.startTimestamp, -1; ts <= ev.endTimestamp; ts += ev.interval {
@@ -2037,11 +2302,13 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 						counter++
 					}
 				}
+				var maxt int64
 				// Evaluate the matrix selector for this series
 				// for this step, but only if this is the 1st
 				// iteration or no @ modifier has been used.
-				if ts == ev.startTimestamp || selVS.Timestamp == nil {
-					maxt := ts - offset
+				refetch := ts == ev.startTimestamp || selVS.Timestamp == nil
+				if refetch {
+					maxt = ts - offset
 					mint := maxt - selRange
 					switch {
 					case selVS.Anchored:
@@ -2050,25 +2317,42 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 						mint -= durationMilliseconds(ev.lookbackDelta)
 						maxt += durationMilliseconds(ev.lookbackDelta)
 					}
-					floats, histograms = ev.matrixIterSlice(it, mint, maxt, floats, histograms)
+					floats, histograms, startTimestamps = ev.matrixIterSlice(it, mint, maxt, floats, histograms, startTimestamps)
 				}
 				if len(floats)+len(histograms) == 0 {
 					continue
 				}
-				if selVS.Anchored || selVS.Smoothed {
-					if len(histograms) > 0 {
-						// TODO: support native histograms.
-						ev.errorf("smoothed and anchored modifiers do not work with native histograms")
+				// fullWindowCount reflects the matrix window consumed at this
+				// step. With an @ modifier the same window is reused across all
+				// steps, so floats/histograms persist from step 0; computing
+				// this after the conditional re-fetch handles both cases
+				// uniformly.
+				fullWindowCount := int64(len(floats) + totalHPointSize(histograms))
+				// For subquery-derived matrices, SamplesRead was already counted
+				// inside evalSubquery via MergeSamplesReadFromSubquery; skip here
+				// to avoid double-counting the storage I/O. On step 0 the full
+				// window is new; on later steps only points past the previous
+				// step's cutoff are new.
+				var samplesReadCount int64
+				if refetch && !matrixFromSubquery {
+					if step == 0 {
+						samplesReadCount = fullWindowCount
+					} else {
+						samplesReadCount = countSamplesAfter(floats, histograms, maxt-ev.interval)
 					}
 				}
 				inMatrix[0].Floats = floats
 				inMatrix[0].Histograms = histograms
 				enh.Ts = ts
+				enh.StartTimestamps = startTimestamps
 
 				// Make the function call.
 				outVec, annos := call(vectorVals, inMatrix, e.Args, enh)
 				warnings.Merge(annos)
-				ev.samplesStats.IncrementSamplesAtStep(step, int64(len(floats)+totalHPointSize(histograms)))
+				ev.samplesStats.IncrementSamplesAtStep(step, fullWindowCount)
+				if samplesReadCount > 0 {
+					ev.samplesStats.IncrementSamplesReadAtStep(step, samplesReadCount)
+				}
 
 				enh.Out = outVec[:0]
 				if len(outVec) > 0 {
@@ -2254,7 +2538,8 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			ev.error(errWithWarnings{fmt.Errorf("expanding series: %w", err), ws})
 		}
 		if e.Smoothed {
-			mat := ev.smoothSeries(e.Series, e.Offset)
+			mat, smoothAnnos := ev.smoothSeries(e.Series, e.Offset, e.PositionRange())
+			ws.Merge(smoothAnnos)
 			return mat, ws
 		}
 		mat := ev.evalSeries(ctx, e.Series, e.Offset, false)
@@ -2267,45 +2552,14 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 		return ev.matrixSelector(ctx, e)
 
 	case *parser.SubqueryExpr:
-		offsetMillis := durationMilliseconds(e.Offset)
-		rangeMillis := durationMilliseconds(e.Range)
-		newEv := &evaluator{
-			endTimestamp:             ev.endTimestamp - offsetMillis,
-			currentSamples:           ev.currentSamples,
-			maxSamples:               ev.maxSamples,
-			logger:                   ev.logger,
-			lookbackDelta:            ev.lookbackDelta,
-			samplesStats:             ev.samplesStats.NewChild(),
-			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
-			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
-			enableTypeAndUnitLabels:  ev.enableTypeAndUnitLabels,
-			querier:                  ev.querier,
-		}
-
-		if e.Step != 0 {
-			newEv.interval = durationMilliseconds(e.Step)
-		} else {
-			newEv.interval = ev.noStepSubqueryIntervalFn(rangeMillis)
-		}
-
-		// Start with the first timestamp after (ev.startTimestamp - offset - range)
-		// that is aligned with the step (multiple of 'newEv.interval').
-		newEv.startTimestamp = newEv.interval * ((ev.startTimestamp - offsetMillis - rangeMillis) / newEv.interval)
-		if newEv.startTimestamp <= (ev.startTimestamp - offsetMillis - rangeMillis) {
-			newEv.startTimestamp += newEv.interval
-		}
-
-		if newEv.startTimestamp != ev.startTimestamp {
-			// Adjust the offset of selectors based on the new
-			// start time of the evaluator since the calculation
-			// of the offset with @ happens w.r.t. the start time.
-			setOffsetForAtModifier(newEv.startTimestamp, e.Expr)
-		}
-
-		res, ws := newEv.eval(ctx, e.Expr)
-		ev.currentSamples = newEv.currentSamples
-		ev.samplesStats.UpdatePeakFromSubquery(newEv.samplesStats)
-		ev.samplesStats.IncrementSamplesAtTimestamp(ev.endTimestamp, newEv.samplesStats.TotalSamples)
+		res, childStats, ws := ev.runSubquery(ctx, e)
+		ev.samplesStats.UpdatePeakFromSubquery(childStats)
+		// Attribute the subquery's TotalSamples to the parent's end step
+		// so they appear in the parent's TotalSamples stat.
+		ev.samplesStats.IncrementSamplesAtTimestamp(ev.endTimestamp, childStats.TotalSamples)
+		// outerOffset=0, outerRange=0: every subquery iteration becomes part of
+		// the parent's matrix output, so no shifting or gap filtering is needed.
+		ev.samplesStats.MergeSamplesReadFromSubquery(childStats, ev.startTimestamp, ev.interval, ev.numSteps(), 0, 0)
 		return res, ws
 	case *parser.StepInvariantExpr:
 		newEv := &evaluator{
@@ -2320,6 +2574,7 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			noStepSubqueryIntervalFn: ev.noStepSubqueryIntervalFn,
 			enableDelayedNameRemoval: ev.enableDelayedNameRemoval,
 			enableTypeAndUnitLabels:  ev.enableTypeAndUnitLabels,
+			useStartTimestamps:       ev.useStartTimestamps,
 			querier:                  ev.querier,
 		}
 		res, ws := newEv.eval(ctx, e.Expr)
@@ -2329,6 +2584,8 @@ func (ev *evaluator) eval(ctx context.Context, expr parser.Expr) (parser.Value, 
 			step++
 			ev.samplesStats.IncrementSamplesAtStep(step, newEv.samplesStats.TotalSamples)
 		}
+		// Subquery ran once; add SamplesRead once at step 0 (not per outer step).
+		ev.samplesStats.IncrementSamplesReadAtStep(0, newEv.samplesStats.SamplesRead)
 		switch e.Expr.(type) {
 		case *parser.MatrixSelector, *parser.SubqueryExpr:
 			// We do not duplicate results for range selectors since result is a matrix
@@ -2419,9 +2676,19 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(ctx context.Co
 		}
 
 		vec := make(Vector, 0, len(vs.Series))
+
+		propagateSTs := e.Func.Name == "start_timestamp" && ev.useStartTimestamps
+
+		var sts []int64
+		if propagateSTs {
+			if enh.StartTimestamps != nil {
+				sts = enh.StartTimestamps.Floats[:0]
+			}
+			sts = slices.Grow(sts, len(vs.Series))[:0]
+		}
 		for i, s := range vs.Series {
 			it := seriesIterators[i]
-			t, _, _, ok := ev.vectorSelectorSingle(it, vs.Offset, enh.Ts)
+			st, t, _, _, ok := ev.vectorSelectorSingle(it, vs.Offset, enh.Ts)
 			if !ok {
 				continue
 			}
@@ -2431,13 +2698,28 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(ctx context.Co
 				Metric: s.Labels(),
 				T:      t,
 			})
+			if propagateSTs {
+				sts = append(sts, st)
+			}
 
 			ev.currentSamples++
 			ev.samplesStats.IncrementSamplesAtTimestamp(enh.Ts, 1)
+			ev.samplesStats.IncrementSamplesReadAtTimestamp(enh.Ts, 1)
 			if ev.currentSamples > ev.maxSamples {
 				ev.error(ErrTooManySamples(env))
 			}
 		}
+
+		if propagateSTs {
+			if enh.StartTimestamps == nil {
+				enh.StartTimestamps = &StartTimestamps{}
+			}
+			enh.StartTimestamps.Floats = sts
+		} else if enh.StartTimestamps != nil {
+			// Clear the slice in case it wasn't empty.
+			enh.StartTimestamps.Floats = enh.StartTimestamps.Floats[:0]
+		}
+
 		ev.samplesStats.UpdatePeak(ev.currentSamples)
 		vec, annos := call([]Vector{vec}, nil, e.Args, enh)
 		return vec, ws.Merge(annos)
@@ -2446,10 +2728,10 @@ func (ev *evaluator) rangeEvalTimestampFunctionOverVectorSelector(ctx context.Co
 
 // vectorSelectorSingle evaluates an instant vector for the iterator of one time series.
 func (ev *evaluator) vectorSelectorSingle(it *storage.MemoizedSeriesIterator, offset time.Duration, ts int64) (
-	int64, float64, *histogram.FloatHistogram, bool,
+	int64, int64, float64, *histogram.FloatHistogram, bool,
 ) {
 	refTime := ts - durationMilliseconds(offset)
-	var t int64
+	var st, t int64
 	var v float64
 	var h *histogram.FloatHistogram
 
@@ -2461,22 +2743,24 @@ func (ev *evaluator) vectorSelectorSingle(it *storage.MemoizedSeriesIterator, of
 		}
 	case chunkenc.ValFloat:
 		t, v = it.At()
+		st = it.AtST()
 	case chunkenc.ValFloatHistogram:
 		t, h = it.AtFloatHistogram()
+		st = it.AtST()
 	default:
 		panic(fmt.Errorf("unknown value type %v", valueType))
 	}
 	if valueType == chunkenc.ValNone || t > refTime {
 		var ok bool
-		t, v, h, ok = it.PeekPrev()
+		st, t, v, h, ok = it.PeekPrev()
 		if !ok || t <= refTime-durationMilliseconds(ev.lookbackDelta) {
-			return 0, 0, nil, false
+			return 0, 0, 0, nil, false
 		}
 	}
 	if value.IsStaleNaN(v) || (h != nil && value.IsStaleNaN(h.Sum)) {
-		return 0, 0, nil, false
+		return 0, 0, 0, nil, false
 	}
-	return t, v, h, true
+	return st, t, v, h, true
 }
 
 var (
@@ -2587,7 +2871,7 @@ func (ev *evaluator) matrixSelector(ctx context.Context, node *parser.MatrixSele
 			Metric: series[i].Labels(),
 		}
 
-		ss.Floats, ss.Histograms = ev.matrixIterSlice(it, mint, maxt, nil, nil)
+		ss.Floats, ss.Histograms, _ = ev.matrixIterSlice(it, mint, maxt, nil, nil, nil)
 		switch {
 		case vs.Anchored:
 			if ss.Histograms != nil {
@@ -2596,12 +2880,13 @@ func (ev *evaluator) matrixSelector(ctx context.Context, node *parser.MatrixSele
 			ss.Floats = extendFloats(ss.Floats, matrixMint, matrixMaxt, false)
 		case vs.Smoothed:
 			if ss.Histograms != nil {
-				ev.errorf("anchored modifier is not supported with histograms")
+				ev.errorf("smoothed modifier is not supported with histograms")
 			}
 			ss.Floats = extendFloats(ss.Floats, matrixMint, matrixMaxt, true)
 		}
 		totalSize := int64(len(ss.Floats)) + int64(totalHPointSize(ss.Histograms))
 		ev.samplesStats.IncrementSamplesAtTimestamp(ev.startTimestamp, totalSize)
+		ev.samplesStats.IncrementSamplesReadAtTimestamp(ev.startTimestamp, totalSize)
 
 		if totalSize > 0 {
 			matrix = append(matrix, ss)
@@ -2621,10 +2906,17 @@ func (ev *evaluator) matrixSelector(ctx context.Context, node *parser.MatrixSele
 // values). Any such points falling before mint are discarded; points that fall
 // into the [mint, maxt] range are retained; only points with later timestamps
 // are populated from the iterator.
+//
+// This function will also optionally track corresponding StartTimestamps for
+// each float/histogram datapoint if the passed-in startTimestamps is non-nil.
+// In this case, the caller must always pass in startTimestamps with fields
+// whose lengths exactly match those of the "floats" and "histograms" slices.
+// Typically this is accomplished by passing in either all empty slices or the
+// values returned by a previous call.
 func (ev *evaluator) matrixIterSlice(
 	it *storage.BufferedSeriesIterator, mint, maxt int64,
-	floats []FPoint, histograms []HPoint,
-) ([]FPoint, []HPoint) {
+	floats []FPoint, histograms []HPoint, startTimestamps *StartTimestamps,
+) ([]FPoint, []HPoint, *StartTimestamps) {
 	mintFloats, mintHistograms := mint, mint
 
 	// First floats...
@@ -2642,10 +2934,21 @@ func (ev *evaluator) matrixIterSlice(
 		floats = floats[:len(floats)-drop]
 		// Only append points with timestamps after the last timestamp we have.
 		mintFloats = floats[len(floats)-1].T
+
+		if startTimestamps != nil {
+			// Truncate startTimestamps at the same drop point.
+			copy(startTimestamps.Floats, startTimestamps.Floats[drop:])
+			startTimestamps.Floats = startTimestamps.Floats[:len(startTimestamps.Floats)-drop]
+		}
 	} else {
 		ev.currentSamples -= len(floats)
 		if floats != nil {
 			floats = floats[:0]
+		}
+
+		if startTimestamps != nil {
+			// Clear the startTimestamps since we are clearing floats now.
+			startTimestamps.Floats = startTimestamps.Floats[:0]
 		}
 	}
 
@@ -2659,6 +2962,7 @@ func (ev *evaluator) matrixIterSlice(
 		var drop int
 		for drop = 0; histograms[drop].T <= mint; drop++ {
 		}
+		droppedSize := totalHPointSize(histograms[:drop])
 		// Rotate the buffer around the drop index so that points before mint can be
 		// reused to store new histograms.
 		tail := make([]HPoint, drop)
@@ -2666,19 +2970,30 @@ func (ev *evaluator) matrixIterSlice(
 		copy(histograms, histograms[drop:])
 		copy(histograms[len(histograms)-drop:], tail)
 		histograms = histograms[:len(histograms)-drop]
-		ev.currentSamples -= totalHPointSize(histograms)
+		ev.currentSamples -= droppedSize
 		// Only append points with timestamps after the last timestamp we have.
 		mintHistograms = histograms[len(histograms)-1].T
+
+		if startTimestamps != nil {
+			// Truncate startTimestamps at the same drop point.
+			copy(startTimestamps.Histograms, startTimestamps.Histograms[drop:])
+			startTimestamps.Histograms = startTimestamps.Histograms[:len(startTimestamps.Histograms)-drop]
+		}
 	} else {
 		ev.currentSamples -= totalHPointSize(histograms)
 		if histograms != nil {
 			histograms = histograms[:0]
 		}
+
+		if startTimestamps != nil {
+			// Clear the startTimestamps since we are clearing histograms now.
+			startTimestamps.Histograms = startTimestamps.Histograms[:0]
+		}
 	}
 
 	if mint == maxt {
 		// Empty range: return the empty slices.
-		return floats, histograms
+		return floats, histograms, startTimestamps
 	}
 
 	soughtValueType := it.Seek(maxt)
@@ -2716,6 +3031,10 @@ loop:
 				if ev.currentSamples > ev.maxSamples {
 					ev.error(ErrTooManySamples(env))
 				}
+
+				if startTimestamps != nil {
+					startTimestamps.Histograms = append(startTimestamps.Histograms, buf.AtST())
+				}
 			}
 		case chunkenc.ValFloat:
 			t, f := buf.At()
@@ -2732,6 +3051,10 @@ loop:
 					floats = getFPointSlice(16)
 				}
 				floats = append(floats, FPoint{T: t, F: f})
+
+				if startTimestamps != nil {
+					startTimestamps.Floats = append(startTimestamps.Floats, buf.AtST())
+				}
 			}
 		}
 	}
@@ -2765,6 +3088,9 @@ loop:
 			ev.error(ErrTooManySamples(env))
 		}
 
+		if startTimestamps != nil {
+			startTimestamps.Histograms = append(startTimestamps.Histograms, it.AtST())
+		}
 	case chunkenc.ValFloat:
 		t, f := it.At()
 		if t == maxt && !value.IsStaleNaN(f) {
@@ -2776,10 +3102,14 @@ loop:
 				floats = getFPointSlice(16)
 			}
 			floats = append(floats, FPoint{T: t, F: f})
+
+			if startTimestamps != nil {
+				startTimestamps.Floats = append(startTimestamps.Floats, it.AtST())
+			}
 		}
 	}
 	ev.samplesStats.UpdatePeak(ev.currentSamples)
-	return floats, histograms
+	return floats, histograms, startTimestamps
 }
 
 func (*evaluator) VectorAnd(lhs, rhs Vector, matching *parser.VectorMatching, lhsh, rhsh []EvalSeriesHelper, enh *EvalNodeHelper) Vector {
@@ -2791,7 +3121,7 @@ func (*evaluator) VectorAnd(lhs, rhs Vector, matching *parser.VectorMatching, lh
 	}
 
 	// Ordinals of signatures present on the right-hand side.
-	rightSigOrdinalsPresent := make([]bool, enh.numSigs)
+	rightSigOrdinalsPresent := enh.resetSigsPresent()
 	for _, sh := range rhsh {
 		rightSigOrdinalsPresent[sh.sigOrdinal] = true
 	}
@@ -2817,7 +3147,7 @@ func (*evaluator) VectorOr(lhs, rhs Vector, matching *parser.VectorMatching, lhs
 		return enh.Out
 	}
 
-	leftSigOrdinalsPresent := make([]bool, enh.numSigs)
+	leftSigOrdinalsPresent := enh.resetSigsPresent()
 	// Add everything from the left-hand-side Vector.
 	for i, ls := range lhs {
 		leftSigOrdinalsPresent[lhsh[i].sigOrdinal] = true
@@ -2844,7 +3174,7 @@ func (*evaluator) VectorUnless(lhs, rhs Vector, matching *parser.VectorMatching,
 	}
 
 	// Ordinals of signatures present on the right-hand side.
-	rightSigOrdinalsPresent := make([]bool, enh.numSigs)
+	rightSigOrdinalsPresent := enh.resetSigsPresent()
 	for _, sh := range rhsh {
 		rightSigOrdinalsPresent[sh.sigOrdinal] = true
 	}
@@ -2876,19 +3206,16 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 	}
 
 	// All samples from the rhs by their join signature ordinal.
-	if enh.rightSigs == nil {
-		enh.rightSigs = make(map[int]Sample, len(enh.Out))
-	} else {
-		clear(enh.rightSigs)
-	}
-	rightSigs := enh.rightSigs
+	rightSigs := enh.resetRightSigs()
+	rightSigsPresent := enh.resetSigsPresent()
 
 	// Add all rhs samples to a map so we can easily find matches later.
 	for i, rs := range rhs {
 		sigOrd := rhsh[i].sigOrdinal
 		// The rhs is guaranteed to be the 'one' side. Having multiple samples
 		// with the same signature means that the matching is many-to-many.
-		if duplSample, found := rightSigs[sigOrd]; found {
+		if rightSigsPresent[sigOrd] {
+			duplSample := rightSigs[sigOrd]
 			// oneSide represents which side of the vector represents the 'one' in the many-to-one relationship.
 			oneSide := "right"
 			if matching.Card == parser.CardOneToMany {
@@ -2900,16 +3227,22 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 				";many-to-many matching not allowed: matching labels must be unique on one side", matchedLabels.String(), oneSide, rs.Metric.String(), duplSample.Metric.String())
 		}
 		rightSigs[sigOrd] = rs
+		rightSigsPresent[sigOrd] = true
 	}
 
-	// Tracks the matching by signature ordinals. For one-to-one operations the value is nil.
-	// For many-to-one the value is a set of hashes to detect duplicated result elements.
-	if enh.matchedSigs == nil {
-		enh.matchedSigs = make(map[int]map[uint64]struct{}, len(rightSigs))
+	var (
+		// Tracks the match-signature for one-to-one operations.
+		matchedSigsPresent []bool
+
+		// Tracks the match-signature for many-to-one operations, the value is a set of signatures
+		// to detect duplicated result elements.
+		matchedSigs []map[uint64]struct{}
+	)
+	if matching.Card == parser.CardOneToOne {
+		matchedSigsPresent = enh.resetMatchedSigsPresent()
 	} else {
-		clear(enh.matchedSigs)
+		matchedSigs = enh.resetMatchedSigs()
 	}
-	matchedSigs := enh.matchedSigs
 
 	var lastErr error
 
@@ -2938,26 +3271,26 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 			}
 		}
 
-		metric := resultMetric(ls.Metric, rs.Metric, op, matching, enh)
-		if !ev.enableDelayedNameRemoval && returnBool {
-			metric = metric.DropReserved(schema.IsMetadataLabel)
-		}
-		insertedSigs, exists := matchedSigs[sigOrd]
+		dropMetricName := !ev.enableDelayedNameRemoval && returnBool
+		metric := resultMetric(ls.Metric, rs.Metric, op, matching, dropMetricName, enh)
+
 		if matching.Card == parser.CardOneToOne {
-			if exists {
+			if matchedSigsPresent[sigOrd] {
 				ev.errorf("multiple matches for labels: many-to-one matching must be explicit (group_left/group_right)")
 			}
-			matchedSigs[sigOrd] = nil // Set existence to true.
+			matchedSigsPresent[sigOrd] = true
 		} else {
 			// In many-to-one matching the grouping labels have to ensure a unique metric
 			// for the result Vector. Check whether those labels have already been added for
 			// the same matching labels.
 			insertSig := metric.Hash()
 
-			if !exists {
-				insertedSigs = map[uint64]struct{}{}
-				matchedSigs[sigOrd] = insertedSigs
-			} else if _, duplicate := insertedSigs[insertSig]; duplicate {
+			if matchedSigs[sigOrd] == nil {
+				matchedSigs[sigOrd] = map[uint64]struct{}{}
+			}
+			insertedSigs := matchedSigs[sigOrd]
+
+			if _, duplicate := insertedSigs[insertSig]; duplicate {
 				ev.errorf("multiple matches for labels: grouping labels must ensure unique matches")
 			}
 			insertedSigs[insertSig] = struct{}{}
@@ -2980,8 +3313,12 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 	for i, ls := range lhs {
 		sigOrd := lhsh[i].sigOrdinal
 
-		rs, found := rightSigs[sigOrd] // Look for a match in the rhs Vector.
-		if !found {
+		var rs Sample
+		if rightSigsPresent[sigOrd] {
+			// Found a match in the rhs.
+			rs = rightSigs[sigOrd]
+		} else {
+			// Have to fall back to the fill value.
 			fill := matching.FillValues.RHS
 			if fill == nil {
 				continue
@@ -2998,8 +3335,11 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 	// For any rhs samples which have not been matched, check if we need to
 	// perform the operation with a fill value from the lhs.
 	if fill := matching.FillValues.LHS; fill != nil {
-		for sigOrd, rs := range rightSigs {
-			if _, matched := matchedSigs[sigOrd]; matched {
+		for i, rs := range rhs {
+			sigOrd := rhsh[i].sigOrdinal
+
+			if (matching.Card == parser.CardOneToOne && matchedSigsPresent[sigOrd]) ||
+				(matching.Card != parser.CardOneToOne && len(matchedSigs[sigOrd]) > 0) {
 				continue // Already matched.
 			}
 			ls := Sample{
@@ -3016,7 +3356,7 @@ func (ev *evaluator) VectorBinop(op parser.ItemType, lhs, rhs Vector, matching *
 
 // resultMetric returns the metric for the given sample(s) based on the Vector
 // binary operation and the matching options.
-func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.VectorMatching, enh *EvalNodeHelper) labels.Labels {
+func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.VectorMatching, dropMetricName bool, enh *EvalNodeHelper) labels.Labels {
 	if enh.resultMetric == nil {
 		enh.resultMetric = make(map[string]labels.Labels, len(enh.Out))
 	}
@@ -3034,7 +3374,7 @@ func resultMetric(lhs, rhs labels.Labels, op parser.ItemType, matching *parser.V
 	str := string(enh.lblResultBuf)
 
 	enh.resetBuilder(lhs)
-	if changesMetricSchema(op) {
+	if dropMetricName || changesMetricSchema(op) {
 		// Setting empty Metadata causes the deletion of those if they exists.
 		schema.Metadata{}.SetToLabels(enh.lb)
 	}
@@ -3172,6 +3512,8 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 				return lhs, nil, lhs <= rhs, nil, nil
 			case parser.ATAN2:
 				return math.Atan2(lhs, rhs), nil, true, nil, nil
+			case parser.TRIM_LOWER, parser.TRIM_UPPER:
+				return 0, nil, false, nil, annotations.NewIncompatibleTypesInBinOpInfo("float", parser.ItemTypeStr[op], "float", pos)
 			}
 		}
 	case hlhs == nil && hrhs != nil:
@@ -3179,7 +3521,7 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 			switch op {
 			case parser.MUL:
 				return 0, hrhs.Copy().Mul(lhs).Compact(0), true, nil, nil
-			case parser.ADD, parser.SUB, parser.DIV, parser.POW, parser.MOD, parser.EQLC, parser.NEQ, parser.GTR, parser.LSS, parser.GTE, parser.LTE, parser.ATAN2:
+			case parser.ADD, parser.SUB, parser.DIV, parser.POW, parser.MOD, parser.EQLC, parser.NEQ, parser.GTR, parser.TRIM_LOWER, parser.TRIM_UPPER, parser.LSS, parser.GTE, parser.LTE, parser.ATAN2:
 				return 0, nil, false, nil, annotations.NewIncompatibleTypesInBinOpInfo("float", parser.ItemTypeStr[op], "histogram", pos)
 			}
 		}
@@ -3190,6 +3532,12 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 				return 0, hlhs.Copy().Mul(rhs).Compact(0), true, nil, nil
 			case parser.DIV:
 				return 0, hlhs.Copy().Div(rhs).Compact(0), true, nil, nil
+			// TrimBuckets mutates its receiver in place, and hlhs may be shared
+			// with other samples/series, so trim a copy rather than hlhs itself.
+			case parser.TRIM_UPPER:
+				return 0, hlhs.Copy().TrimBuckets(rhs, true), true, nil, nil
+			case parser.TRIM_LOWER:
+				return 0, hlhs.Copy().TrimBuckets(rhs, false), true, nil, nil
 			case parser.ADD, parser.SUB, parser.POW, parser.MOD, parser.EQLC, parser.NEQ, parser.GTR, parser.LSS, parser.GTE, parser.LTE, parser.ATAN2:
 				return 0, nil, false, nil, annotations.NewIncompatibleTypesInBinOpInfo("histogram", parser.ItemTypeStr[op], "float", pos)
 			}
@@ -3230,7 +3578,7 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 			case parser.NEQ:
 				// This operation expects that both histograms are compacted.
 				return 0, hlhs, !hlhs.Equals(hrhs), nil, nil
-			case parser.MUL, parser.DIV, parser.POW, parser.MOD, parser.GTR, parser.LSS, parser.GTE, parser.LTE, parser.ATAN2:
+			case parser.MUL, parser.DIV, parser.POW, parser.MOD, parser.GTR, parser.LSS, parser.GTE, parser.LTE, parser.ATAN2, parser.TRIM_LOWER, parser.TRIM_UPPER:
 				return 0, nil, false, nil, annotations.NewIncompatibleTypesInBinOpInfo("histogram", parser.ItemTypeStr[op], "histogram", pos)
 			}
 		}
@@ -3239,23 +3587,26 @@ func vectorElemBinop(op parser.ItemType, lhs, rhs float64, hlhs, hrhs *histogram
 }
 
 type groupedAggregation struct {
-	floatValue     float64
-	histogramValue *histogram.FloatHistogram
-	floatMean      float64
-	floatKahanC    float64 // "Compensating value" for Kahan summation.
-	groupCount     float64
-	heap           vectorByValueHeap
+	floatValue      float64
+	floatMean       float64
+	floatKahanC     float64 // Compensation float for Kahan summation.
+	histogramValue  *histogram.FloatHistogram
+	histogramMean   *histogram.FloatHistogram
+	histogramKahanC *histogram.FloatHistogram // Compensation histogram for Kahan summation.
+	groupCount      float64
+	heap            vectorByValueHeap
 
 	// All bools together for better packing within the struct.
-	seen                   bool // Was this output groups seen in the input at this timestamp.
-	hasFloat               bool // Has at least 1 float64 sample aggregated.
-	hasHistogram           bool // Has at least 1 histogram sample aggregated.
-	incompatibleHistograms bool // If true, group has seen mixed exponential and custom buckets.
-	groupAggrComplete      bool // Used by LIMITK to short-cut series loop when we've reached K elem on every group.
-	incrementalMean        bool // True after reverting to incremental calculation of the mean value.
-	counterResetSeen       bool // Counter reset hint CounterReset seen. Currently only used for histogram samples.
-	notCounterResetSeen    bool // Counter reset hint NotCounterReset seen. Currently only used for histogram samples.
-	dropName               bool // True if any sample in this group has DropName set.
+	seen                     bool // Was this output groups seen in the input at this timestamp.
+	hasFloat                 bool // Has at least 1 float64 sample aggregated.
+	hasHistogram             bool // Has at least 1 histogram sample aggregated.
+	incompatibleHistograms   bool // If true, group has seen mixed exponential and custom buckets.
+	groupAggrComplete        bool // Used by LIMITK to short-cut series loop when we've reached K elem on every group.
+	floatIncrementalMean     bool // True after reverting to incremental calculation for float-based mean value.
+	histogramIncrementalMean bool // True after reverting to incremental calculation for histogram-based mean value.
+	counterResetSeen         bool // Counter reset hint CounterReset seen. Currently only used for histogram samples.
+	notCounterResetSeen      bool // Counter reset hint NotCounterReset seen. Currently only used for histogram samples.
+	dropName                 bool // True if any sample in this group has DropName set.
 }
 
 // aggregation evaluates sum, avg, count, stdvar, stddev or quantile at one timestep on inputMatrix.
@@ -3345,6 +3696,11 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 			group.dropName = true
 		}
 
+		var (
+			nhcbBoundsReconciled bool
+			err                  error
+		)
+
 		switch op {
 		case parser.SUM:
 			if h != nil {
@@ -3356,7 +3712,7 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 					case histogram.NotCounterReset:
 						group.notCounterResetSeen = true
 					}
-					_, _, nhcbBoundsReconciled, err := group.histogramValue.Add(h)
+					group.histogramKahanC, _, nhcbBoundsReconciled, err = group.histogramValue.KahanAdd(h, group.histogramKahanC)
 					if err != nil {
 						handleAggregationError(err, e, inputMatrix[si].Metric.Get(model.MetricNameLabel), &annos)
 						group.incompatibleHistograms = true
@@ -3370,18 +3726,13 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 				// point in copying the histogram in that case.
 			} else {
 				group.hasFloat = true
-				group.floatValue, group.floatKahanC = kahanSumInc(f, group.floatValue, group.floatKahanC)
+				group.floatValue, group.floatKahanC = kahansum.Inc(f, group.floatValue, group.floatKahanC)
 			}
 
 		case parser.AVG:
-			// For the average calculation of histograms, we use
-			// incremental mean calculation without the help of
-			// Kahan summation (but this should change, see
-			// https://github.com/prometheus/prometheus/issues/14105
-			// ). For floats, we improve the accuracy with the help
-			// of Kahan summation. For a while, we assumed that
-			// incremental mean calculation combined with Kahan
-			// summation (see
+			// We improve the accuracy with the help of Kahan summation.
+			// For a while, we assumed that incremental mean calculation
+			// combined with Kahan summation (see
 			// https://stackoverflow.com/questions/61665473/is-it-beneficial-for-precision-to-calculate-the-incremental-mean-average
 			// for inspiration) is generally the preferred solution.
 			// However, it then turned out that direct mean
@@ -3416,20 +3767,37 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 					case histogram.NotCounterReset:
 						group.notCounterResetSeen = true
 					}
-					left := h.Copy().Div(group.groupCount)
-					right := group.histogramValue.Copy().Div(group.groupCount)
-
-					toAdd, _, nhcbBoundsReconciled, err := left.Sub(right)
-					if err != nil {
-						handleAggregationError(err, e, inputMatrix[si].Metric.Get(model.MetricNameLabel), &annos)
-						group.incompatibleHistograms = true
-						continue
+					if !group.histogramIncrementalMean {
+						v := group.histogramValue.Copy()
+						var c *histogram.FloatHistogram
+						if group.histogramKahanC != nil {
+							c = group.histogramKahanC.Copy()
+						}
+						c, _, nhcbBoundsReconciled, err = v.KahanAdd(h, c)
+						if err != nil {
+							handleAggregationError(err, e, inputMatrix[si].Metric.Get(model.MetricNameLabel), &annos)
+							group.incompatibleHistograms = true
+							continue
+						}
+						if nhcbBoundsReconciled {
+							annos.Add(annotations.NewMismatchedCustomBucketsHistogramsInfo(e.Expr.PositionRange(), annotations.HistogramAgg))
+						}
+						if !v.HasOverflow() {
+							group.histogramValue, group.histogramKahanC = v, c
+							break
+						}
+						group.histogramIncrementalMean = true
+						group.histogramMean = group.histogramValue.Copy().Div(group.groupCount - 1)
+						if group.histogramKahanC != nil {
+							group.histogramKahanC.Div(group.groupCount - 1)
+						}
 					}
-					if nhcbBoundsReconciled {
-						annos.Add(annotations.NewMismatchedCustomBucketsHistogramsInfo(e.Expr.PositionRange(), annotations.HistogramAgg))
+					q := (group.groupCount - 1) / group.groupCount
+					if group.histogramKahanC != nil {
+						group.histogramKahanC.Mul(q)
 					}
-
-					_, _, nhcbBoundsReconciled, err = group.histogramValue.Add(toAdd)
+					toAdd := h.Copy().Div(group.groupCount)
+					group.histogramKahanC, _, nhcbBoundsReconciled, err = group.histogramMean.Mul(q).KahanAdd(toAdd, group.histogramKahanC)
 					if err != nil {
 						handleAggregationError(err, e, inputMatrix[si].Metric.Get(model.MetricNameLabel), &annos)
 						group.incompatibleHistograms = true
@@ -3444,8 +3812,8 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 				// point in copying the histogram in that case.
 			} else {
 				group.hasFloat = true
-				if !group.incrementalMean {
-					newV, newC := kahanSumInc(f, group.floatValue, group.floatKahanC)
+				if !group.floatIncrementalMean {
+					newV, newC := kahansum.Inc(f, group.floatValue, group.floatKahanC)
 					if !math.IsInf(newV, 0) {
 						// The sum doesn't overflow, so we propagate it to the
 						// group struct and continue with the regular
@@ -3456,12 +3824,12 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 					// If we are here, we know that the sum _would_ overflow. So
 					// instead of continue to sum up, we revert to incremental
 					// calculation of the mean value from here on.
-					group.incrementalMean = true
+					group.floatIncrementalMean = true
 					group.floatMean = group.floatValue / (group.groupCount - 1)
 					group.floatKahanC /= group.groupCount - 1
 				}
 				q := (group.groupCount - 1) / group.groupCount
-				group.floatMean, group.floatKahanC = kahanSumInc(
+				group.floatMean, group.floatKahanC = kahansum.Inc(
 					f/group.groupCount,
 					q*group.floatMean,
 					q*group.floatKahanC,
@@ -3536,8 +3904,24 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 			case aggr.incompatibleHistograms:
 				continue
 			case aggr.hasHistogram:
+				if aggr.histogramIncrementalMean {
+					if aggr.histogramKahanC != nil {
+						aggr.histogramValue, _, _, _ = aggr.histogramMean.Add(aggr.histogramKahanC)
+						// Add can theoretically return ErrHistogramsIncompatibleSchema, but at
+						// this stage errors should not occur if earlier KahanAdd calls succeeded.
+					} else {
+						aggr.histogramValue = aggr.histogramMean
+					}
+				} else {
+					aggr.histogramValue.Div(aggr.groupCount)
+					if aggr.histogramKahanC != nil {
+						aggr.histogramValue, _, _, _ = aggr.histogramValue.Add(aggr.histogramKahanC.Div(aggr.groupCount))
+						// Add can theoretically return ErrHistogramsIncompatibleSchema, but at
+						// this stage errors should not occur if earlier KahanAdd calls succeeded.
+					}
+				}
 				aggr.histogramValue = aggr.histogramValue.Compact(0)
-			case aggr.incrementalMean:
+			case aggr.floatIncrementalMean:
 				aggr.floatValue = aggr.floatMean + aggr.floatKahanC
 			default:
 				aggr.floatValue = aggr.floatValue/aggr.groupCount + aggr.floatKahanC/aggr.groupCount
@@ -3565,6 +3949,11 @@ func (ev *evaluator) aggregation(e *parser.AggregateExpr, q float64, inputMatrix
 			case aggr.incompatibleHistograms:
 				continue
 			case aggr.hasHistogram:
+				if aggr.histogramKahanC != nil {
+					aggr.histogramValue, _, _, _ = aggr.histogramValue.Add(aggr.histogramKahanC)
+					// Add can theoretically return ErrHistogramsIncompatibleSchema, but at
+					// this stage errors should not occur if earlier KahanAdd calls succeeded.
+				}
 				aggr.histogramValue.Compact(0)
 			default:
 				aggr.floatValue += aggr.floatKahanC
@@ -4074,11 +4463,51 @@ func unwrapParenExpr(e *parser.Expr) {
 	}
 }
 
-func unwrapStepInvariantExpr(e parser.Expr) parser.Expr {
-	if p, ok := e.(*parser.StepInvariantExpr); ok {
-		return p.Expr
+// foldQueryContextFunctions rewrites calls to start(), end(), range(), and step() into
+// NumberLiteral nodes, since their values are constant for a given query execution.
+// This allows parent expressions to be correctly recognized as step-invariant by preprocessExprHelper.
+func foldQueryContextFunctions(expr parser.Expr, start, end time.Time, step time.Duration) parser.Expr {
+	if call, ok := expr.(*parser.Call); ok {
+		switch call.Func.Name {
+		case "start":
+			return &parser.NumberLiteral{Val: float64(timestamp.FromTime(start)) / 1000, PosRange: call.PosRange}
+		case "end":
+			return &parser.NumberLiteral{Val: float64(timestamp.FromTime(end)) / 1000, PosRange: call.PosRange}
+		case "range":
+			return &parser.NumberLiteral{Val: end.Sub(start).Seconds(), PosRange: call.PosRange}
+		case "step":
+			var val float64
+			if !start.Equal(end) {
+				val = step.Seconds()
+			}
+			return &parser.NumberLiteral{Val: val, PosRange: call.PosRange}
+		}
 	}
-	return e
+	switch n := expr.(type) {
+	case *parser.BinaryExpr:
+		n.LHS = foldQueryContextFunctions(n.LHS, start, end, step)
+		n.RHS = foldQueryContextFunctions(n.RHS, start, end, step)
+	case *parser.Call:
+		for i := range n.Args {
+			n.Args[i] = foldQueryContextFunctions(n.Args[i], start, end, step)
+		}
+	case *parser.AggregateExpr:
+		n.Expr = foldQueryContextFunctions(n.Expr, start, end, step)
+		if n.Param != nil {
+			n.Param = foldQueryContextFunctions(n.Param, start, end, step)
+		}
+	case *parser.UnaryExpr:
+		n.Expr = foldQueryContextFunctions(n.Expr, start, end, step)
+	case *parser.ParenExpr:
+		n.Expr = foldQueryContextFunctions(n.Expr, start, end, step)
+	case *parser.SubqueryExpr:
+		n.Expr = foldQueryContextFunctions(n.Expr, start, end, step)
+	case *parser.MatrixSelector, *parser.VectorSelector, *parser.NumberLiteral, *parser.StringLiteral:
+		// Leaf nodes or nodes without foldable sub-expressions.
+	default:
+		panic(fmt.Sprintf("foldQueryContextFunctions: unhandled node type %T", expr))
+	}
+	return expr
 }
 
 // PreprocessExpr wraps all possible step invariant parts of the given expression with
@@ -4086,6 +4515,8 @@ func unwrapStepInvariantExpr(e parser.Expr) parser.Expr {
 // into their numeric values and removes superfluous parenthesis on parameters to functions and aggregations.
 func PreprocessExpr(expr parser.Expr, start, end time.Time, step time.Duration) (parser.Expr, error) {
 	detectHistogramStatsDecoding(expr)
+
+	expr = foldQueryContextFunctions(expr, start, end, step)
 
 	if err := parser.Walk(&durationVisitor{step: step, queryRange: end.Sub(start)}, expr, nil); err != nil {
 		return nil, err
@@ -4139,15 +4570,24 @@ func preprocessExprHelper(expr parser.Expr, start, end time.Time) (isStepInvaria
 	case *parser.Call:
 		_, ok := AtModifierUnsafeFunctions[n.Func.Name]
 		isStepInvariant := !ok
+		// A special case to allow timestamp() to be wrapped in a step invariant.
+		// timestamp() is considered AtModifierUnsafe, but it can be safe depending on its arguments.
+		// ie timestamp(metric @ 1) is step invariant, but timestamp(abs(metric @ 1)) is not.
+		isTimestampWithAllArgsStepInvariantSafe := n.Func.Name == "timestamp"
 		shouldWrap := make([]bool, len(n.Args))
 		for i := range n.Args {
 			unwrapParenExpr(&n.Args[i])
 			var argIsStepInvariant bool
 			argIsStepInvariant, shouldWrap[i] = preprocessExprHelper(n.Args[i], start, end)
 			isStepInvariant = isStepInvariant && argIsStepInvariant
+
+			_, argIsVectorSelector := n.Args[i].(*parser.VectorSelector)
+			if !argIsStepInvariant || !argIsVectorSelector {
+				isTimestampWithAllArgsStepInvariantSafe = false
+			}
 		}
 
-		if isStepInvariant {
+		if isStepInvariant || isTimestampWithAllArgsStepInvariantSafe {
 			// The function and all arguments are step invariant.
 			return true, true
 		}
@@ -4248,31 +4688,37 @@ func detectHistogramStatsDecoding(expr parser.Expr) {
 
 	pathLoop:
 		for i := len(path) - 1; i >= 0; i-- { // Walk backwards up the path.
-			if _, ok := path[i].(*parser.SubqueryExpr); ok {
+			switch p := path[i].(type) {
+			case *parser.SubqueryExpr:
 				// If we ever see a subquery in the path, we
 				// will not skip the buckets. We need the
 				// buckets for correct counter reset detection.
 				n.SkipHistogramBuckets = false
 				break pathLoop
-			}
-			call, ok := path[i].(*parser.Call)
-			if !ok {
-				continue pathLoop
-			}
-			switch call.Func.Name {
-			case "histogram_count", "histogram_sum", "histogram_avg":
-				// We allow skipping buckets preliminarily. But
-				// we will continue through the path to see if
-				// we find a subquery (or a histogram function)
-				// further up (the latter wouldn't make sense,
-				// but no harm in detecting it).
-				n.SkipHistogramBuckets = true
-			case "histogram_quantile", "histogram_fraction":
-				// If we ever see a function that needs the
-				// whole histogram, we will not skip the
-				// buckets.
-				n.SkipHistogramBuckets = false
-				break pathLoop
+
+			case *parser.Call:
+				switch p.Func.Name {
+				case "histogram_count", "histogram_sum", "histogram_avg":
+					// We allow skipping buckets preliminarily. But
+					// we will continue through the path to see if
+					// we find a subquery (or a histogram function)
+					// further up (the latter wouldn't make sense,
+					// but no harm in detecting it).
+					n.SkipHistogramBuckets = true
+				case "histogram_quantile", "histogram_quantiles", "histogram_fraction":
+					// If we ever see a function that needs the
+					// whole histogram, we will not skip the
+					// buckets.
+					n.SkipHistogramBuckets = false
+					break pathLoop
+				}
+
+			case *parser.BinaryExpr:
+				if p.Op == parser.TRIM_UPPER || p.Op == parser.TRIM_LOWER {
+					// Trimming depends on buckets, we will not skip them.
+					n.SkipHistogramBuckets = false
+					break pathLoop
+				}
 			}
 		}
 		return nil

@@ -26,6 +26,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -34,6 +35,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/kingpin/v2"
+	"github.com/grafana/regexp"
 	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/expfmt"
@@ -144,6 +146,47 @@ func TestFailedStartupExitCode(t *testing.T) {
 	require.ErrorAs(t, err, &exitError)
 	status := exitError.Sys().(syscall.WaitStatus)
 	require.Equal(t, expectedExitStatus, status.ExitStatus())
+}
+
+func TestRetentionPercentageStartsWithMissingStoragePath(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	t.Parallel()
+
+	tmpDir := t.TempDir()
+	if storagePathFsSize(tmpDir) == 0 {
+		t.Skip("skipping test because filesystem size detection is unavailable.")
+	}
+
+	configFile := filepath.Join(tmpDir, "prometheus.yml")
+	storagePath := filepath.Join(tmpDir, "missing", "data")
+
+	require.NoError(t, os.WriteFile(configFile, []byte(`
+storage:
+  tsdb:
+    retention:
+      percentage: 1.5
+`), 0o777))
+
+	port := testutil.RandomUnprivilegedPort(t)
+	prom := prometheusCommandWithLogging(
+		t,
+		configFile,
+		port,
+		"--storage.tsdb.path="+storagePath,
+	)
+	require.NoError(t, prom.Start())
+
+	require.Eventually(t, func() bool {
+		r, err := http.Get(fmt.Sprintf("http://127.0.0.1:%d/metrics", port))
+		if err != nil {
+			return false
+		}
+		defer r.Body.Close()
+		return r.StatusCode == http.StatusOK
+	}, startupTime, 100*time.Millisecond)
+	require.DirExists(t, storagePath)
 }
 
 type senderFunc func(alerts ...*notifier.Alert)
@@ -353,6 +396,108 @@ func TestMaxBlockChunkSegmentSizeBounds(t *testing.T) {
 	}
 }
 
+func TestChunkEncodingStartupValidation(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping test in short mode.")
+	}
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		config   string
+		features string
+		exitCode int
+	}{
+		{
+			name: "xor2 without xor2-encoding feature",
+			config: `
+storage:
+  tsdb:
+    chunk_encoding:
+      floats: xor2`,
+			features: "",
+			exitCode: 1,
+		},
+		{
+			name: "xor2 with xor2-encoding feature",
+			config: `
+storage:
+  tsdb:
+    chunk_encoding:
+      floats: xor2`,
+			features: "xor2-encoding",
+			exitCode: 0,
+		},
+		{
+			name: "xor with st-storage and xor2-encoding features",
+			config: `
+storage:
+  tsdb:
+    chunk_encoding:
+      floats: xor`,
+			features: "st-storage,xor2-encoding",
+			exitCode: 1,
+		},
+		{
+			name: "xor without st-storage feature",
+			config: `
+storage:
+  tsdb:
+    chunk_encoding:
+      floats: xor`,
+			features: "",
+			exitCode: 0,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			tmpDir := t.TempDir()
+			configFile := filepath.Join(tmpDir, "prometheus.yml")
+			require.NoError(t, os.WriteFile(configFile, []byte(tc.config), 0o777))
+
+			args := []string{"-test.main", "--web.listen-address=0.0.0.0:0", "--config.file=" + configFile, "--storage.tsdb.path=" + filepath.Join(tmpDir, "data")}
+			if tc.features != "" {
+				args = append(args, "--enable-feature="+tc.features)
+			}
+			prom := exec.Command(promPath, args...)
+
+			stderr, err := prom.StderrPipe()
+			require.NoError(t, err)
+
+			var wg sync.WaitGroup
+			wg.Add(1)
+			defer wg.Wait()
+			go func() {
+				defer wg.Done()
+				slurp, _ := io.ReadAll(stderr)
+				t.Log(string(slurp))
+			}()
+
+			require.NoError(t, prom.Start())
+
+			if tc.exitCode == 0 {
+				done := make(chan error, 1)
+				go func() { done <- prom.Wait() }()
+				select {
+				case err := <-done:
+					t.Fatalf("prometheus should be still running: %v", err)
+				case <-time.After(startupTime):
+					prom.Process.Kill()
+					<-done
+				}
+				return
+			}
+
+			err = prom.Wait()
+			require.Error(t, err)
+			var exitError *exec.ExitError
+			require.ErrorAs(t, err, &exitError)
+			status := exitError.Sys().(syscall.WaitStatus)
+			require.Equal(t, tc.exitCode, status.ExitStatus())
+		})
+	}
+}
+
 func TestTimeMetrics(t *testing.T) {
 	tmpDir := t.TempDir()
 
@@ -395,6 +540,7 @@ func TestTimeMetrics(t *testing.T) {
 }
 
 func getCurrentGaugeValuesFor(t *testing.T, reg prometheus.Gatherer, metricNames ...string) map[string]float64 {
+	t.Helper()
 	f, err := reg.Gather()
 	require.NoError(t, err)
 
@@ -426,7 +572,7 @@ func TestAgentSuccessfulStartup(t *testing.T) {
 	go func() { done <- prom.Wait() }()
 	select {
 	case err := <-done:
-		t.Logf("prometheus agent should be still running: %v", err)
+		t.Logf("prometheus agent exited early: %v", err)
 		actualExitStatus = prom.ProcessState.ExitCode()
 	case <-time.After(startupTime):
 		prom.Process.Kill()
@@ -571,12 +717,7 @@ func TestDocumentation(t *testing.T) {
 	var stdout bytes.Buffer
 	cmd.Stdout = &stdout
 
-	if err := cmd.Run(); err != nil {
-		var exitError *exec.ExitError
-		if errors.As(err, &exitError) && exitError.ExitCode() != 0 {
-			fmt.Println("Command failed with non-zero exit code")
-		}
-	}
+	require.NoError(t, cmd.Run(), "failed to generate CLI documentation via --write-documentation")
 
 	generatedContent := strings.ReplaceAll(stdout.String(), filepath.Base(promPath), strings.TrimSuffix(filepath.Base(promPath), ".test"))
 
@@ -660,7 +801,7 @@ func reloadPrometheusConfig(t *testing.T, reloadURL string) {
 	require.Equal(t, http.StatusOK, r.StatusCode, "Unexpected status code when reloading Prometheus")
 }
 
-func getMetricValue(t *testing.T, body io.Reader, metricType model.MetricType, metricName string) (float64, error) {
+func getMetricValue(t testing.TB, body io.Reader, metricType model.MetricType, metricName string) (float64, error) {
 	t.Helper()
 
 	p := expfmt.NewTextParser(model.UTF8Validation)
@@ -753,7 +894,7 @@ global:
 			configFile := filepath.Join(tmpDir, "prometheus.yml")
 
 			port := testutil.RandomUnprivilegedPort(t)
-			os.WriteFile(configFile, []byte(tc.config), 0o777)
+			require.NoError(t, os.WriteFile(configFile, []byte(tc.config), 0o777))
 			prom := prometheusCommandWithLogging(
 				t,
 				configFile,
@@ -801,7 +942,7 @@ global:
 			newConfig := `
 runtime:
   gogc: 99`
-			os.WriteFile(configFile, []byte(newConfig), 0o777)
+			require.NoError(t, os.WriteFile(configFile, []byte(newConfig), 0o777))
 			reloadPrometheusConfig(t, reloadURL)
 			ensureGOGCValue(99.0)
 		})
@@ -834,7 +975,7 @@ scrape_configs:
     static_configs:
       - targets: ['localhost:%d']
 `, port, port)
-			os.WriteFile(configFile, []byte(config), 0o777)
+			require.NoError(t, os.WriteFile(configFile, []byte(config), 0o777))
 
 			prom := prometheusCommandWithLogging(
 				t,
@@ -894,8 +1035,10 @@ func TestRemoteWrite_PerQueueMetricsAfterRelabeling(t *testing.T) {
 	port := testutil.RandomUnprivilegedPort(t)
 	targetPort := testutil.RandomUnprivilegedPort(t)
 
-	server := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {
-		panic("should never be reached")
+	server := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		require.NoError(t, err)
+		require.Fail(t, "should never be reached because the remote write relabeling shouldn't yield anything", "header: %v, body: %s", r.Header, body)
 	}))
 	t.Cleanup(server.Close)
 
@@ -979,7 +1122,6 @@ remote_write:
 // | dataPending         | 0             | 1228.8              |
 // | desiredShards       | 0.6           | 369.2               |.
 func TestRemoteWrite_ReshardingWithoutDeadlock(t *testing.T) {
-	t.Skip("flaky test, see https://github.com/prometheus/prometheus/issues/17489")
 	t.Parallel()
 
 	tmpDir := t.TempDir()
@@ -995,7 +1137,7 @@ func TestRemoteWrite_ReshardingWithoutDeadlock(t *testing.T) {
 	config := fmt.Sprintf(`
 global:
   # Using a smaller interval may cause the scrape to time out.
-  scrape_interval: 1s  
+  scrape_interval: 1s
 scrape_configs:
   - job_name: 'self'
     static_configs:
@@ -1064,4 +1206,31 @@ remote_write:
 		return true
 		// 3*shardUpdateDuration to allow for the resharding logic to run.
 	}, 30*time.Second, time.Second)
+}
+
+// TestFeatureFlagsDocumented ensures the --enable-feature help text in main.go
+// and the documented flags in docs/feature_flags.md list the same set of flags.
+func TestFeatureFlagsDocumented(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.SkipNow()
+	}
+	h, err := os.ReadFile(filepath.Join("..", "..", "cmd", "prometheus", "main.go"))
+	require.NoError(t, err)
+	m := regexp.MustCompile(`a\.Flag\("enable-feature", "Comma separated feature names to enable. Valid options: (.+?)\.`).FindSubmatch(h)
+	require.NotNil(t, m)
+	var helpFlags []string
+	for f := range strings.SplitSeq(string(m[1]), ",") {
+		helpFlags = append(helpFlags, strings.TrimSpace(f))
+	}
+	require.NotEmpty(t, helpFlags)
+
+	d, err := os.ReadFile(filepath.Join("..", "..", "docs", "feature_flags.md"))
+	require.NoError(t, err)
+	var docFlags []string
+	for _, dm := range regexp.MustCompile("(?m)^`--enable-feature=(.+)`$").FindAllSubmatch(d, -1) {
+		docFlags = append(docFlags, string(dm[1]))
+	}
+	require.NotEmpty(t, docFlags)
+	require.True(t, slices.IsSorted(helpFlags))
+	require.ElementsMatch(t, helpFlags, docFlags)
 }

@@ -14,7 +14,13 @@
 package aws
 
 import (
+	"context"
 	"errors"
+	"math/rand/v2"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -24,6 +30,7 @@ import (
 )
 
 func TestRoleUnmarshalYAML(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		input    string
@@ -78,6 +85,7 @@ func TestRoleUnmarshalYAML(t *testing.T) {
 }
 
 func TestRoleString(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name     string
 		role     Role
@@ -108,16 +116,19 @@ func TestRoleString(t *testing.T) {
 }
 
 func TestSDConfigName(t *testing.T) {
+	t.Parallel()
 	cfg := &SDConfig{}
 	require.Equal(t, "aws", cfg.Name())
 }
 
 func TestDefaultSDConfig(t *testing.T) {
+	t.Parallel()
 	require.Equal(t, Role(""), DefaultSDConfig.Role)
 	require.Equal(t, model.Duration(60*time.Second), DefaultSDConfig.RefreshInterval)
 }
 
 func TestSDConfigUnmarshalYAML(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		yaml         string
@@ -167,6 +178,24 @@ port: 9300`,
 				require.Equal(t, 9300, cfg.LightsailSDConfig.Port)
 			},
 		},
+		{
+			name: "RDSWithFlatFields",
+			yaml: `role: rds
+region: us-east-1
+port: 9400
+filters:
+  - name: engine
+    values: [aurora-postgresql]`,
+			validateFunc: func(t *testing.T, cfg *SDConfig) {
+				require.Equal(t, RoleRDS, cfg.Role)
+				require.NotNil(t, cfg.RDSSDConfig)
+				require.Equal(t, "us-east-1", cfg.RDSSDConfig.Region)
+				require.Equal(t, 9400, cfg.RDSSDConfig.Port)
+				require.Len(t, cfg.RDSSDConfig.Filters, 1)
+				require.Equal(t, "engine", cfg.RDSSDConfig.Filters[0].Name)
+				require.Equal(t, []string{"aurora-postgresql"}, cfg.RDSSDConfig.Filters[0].Values)
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -183,6 +212,7 @@ port: 9300`,
 // all configs pointed to the same global default, causing port and other
 // settings from one job to overwrite settings in another job.
 func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
+	t.Parallel()
 	tests := []struct {
 		name         string
 		yaml         string
@@ -272,6 +302,32 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 					"LightsailSDConfig objects should not share the same memory address")
 			},
 		},
+		{
+			name: "MSKMultipleJobsDifferentPorts",
+			yaml: `
+- role: msk
+  region: ap-south-1
+  port: 6060
+  clusters: ["cluster-1"]
+- role: msk
+  region: ap-south-1
+  port: 6061
+  clusters: ["cluster-2"]`,
+			validateFunc: func(t *testing.T, cfg1, cfg2 *SDConfig) {
+				require.Equal(t, RoleMSK, cfg1.Role)
+				require.Equal(t, RoleMSK, cfg2.Role)
+				require.NotNil(t, cfg1.MSKSDConfig)
+				require.NotNil(t, cfg2.MSKSDConfig)
+
+				require.Equal(t, 6060, cfg1.MSKSDConfig.Port)
+				require.Equal(t, []string{"cluster-1"}, cfg1.MSKSDConfig.Clusters)
+				require.Equal(t, 6061, cfg2.MSKSDConfig.Port)
+				require.Equal(t, []string{"cluster-2"}, cfg2.MSKSDConfig.Clusters)
+
+				require.NotSame(t, cfg1.MSKSDConfig, cfg2.MSKSDConfig,
+					"MSKSDConfig objects should not share the same memory address")
+			},
+		},
 	}
 
 	for _, tt := range tests {
@@ -282,4 +338,294 @@ func TestMultipleSDConfigsDoNotShareState(t *testing.T) {
 			tt.validateFunc(t, &configs[0], &configs[1])
 		})
 	}
+}
+
+// getRandomRegion is a helper to return a pseudo-random AWS region for testing.
+func getRandomRegion() string {
+	regions := []string{
+		"us-east-1",
+		"us-east-2",
+		"us-west-1",
+		"us-west-2",
+		"eu-west-1",
+		"eu-west-2",
+		"ap-southeast-1",
+		"ap-southeast-2",
+		"ap-northeast-1",
+		"ap-northeast-2",
+	}
+
+	return regions[rand.IntN(len(regions))]
+}
+
+func TestLoadRegion(t *testing.T) {
+	t.Run("with_env_region", func(t *testing.T) {
+		randomRegion := getRandomRegion()
+		t.Setenv("AWS_REGION", randomRegion)
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+		t.Setenv("AWS_CONFIG_FILE", "") // Ensure no config file is used
+		t.Setenv("AWS_PROFILE", "")     // Ensure no profile file is used
+
+		region, err := loadRegion(context.Background(), "")
+		require.NoError(t, err)
+		require.Equal(t, randomRegion, region)
+	})
+
+	t.Run("with_config_file_default_profile", func(t *testing.T) {
+		randomRegion := getRandomRegion()
+
+		// Create a temporary AWS config file
+		tmpDir := t.TempDir()
+		configFile := filepath.Join(tmpDir, "config")
+
+		configContent := `[default]
+region = ` + randomRegion + `
+`
+
+		err := os.WriteFile(configFile, []byte(configContent), 0o644)
+		require.NoError(t, err)
+		defer os.Remove(configFile)
+
+		// Set up environment to use the config file
+		t.Setenv("AWS_CONFIG_FILE", configFile)
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+		// Clear any region environment variables to force config file usage
+		t.Setenv("AWS_REGION", "")
+		t.Setenv("AWS_PROFILE", "") // Ensure no profile file is used
+		t.Setenv("AWS_DEFAULT_REGION", "")
+
+		region, err := loadRegion(context.Background(), "")
+		require.NoError(t, err)
+		require.Equal(t, randomRegion, region)
+	})
+
+	t.Run("with_config_file_named_profile", func(t *testing.T) {
+		randomRegion := getRandomRegion()
+
+		// Create a temporary AWS config file
+		tmpDir := t.TempDir()
+		configFile := filepath.Join(tmpDir, "config")
+
+		configContent := `[default]
+region = ` + getRandomRegion() + `
+
+[profile ` + randomRegion + `-profile]
+region = ` + randomRegion + `
+`
+
+		err := os.WriteFile(configFile, []byte(configContent), 0o644)
+		require.NoError(t, err)
+		defer os.Remove(configFile)
+
+		// Set up environment to use the config file
+		t.Setenv("AWS_CONFIG_FILE", configFile)
+		t.Setenv("AWS_PROFILE", randomRegion+"-profile")
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+		// Clear any region environment variables to force config file usage
+		t.Setenv("AWS_REGION", "")
+		t.Setenv("AWS_DEFAULT_REGION", "")
+
+		region, err := loadRegion(context.Background(), "")
+		require.NoError(t, err)
+		require.Equal(t, randomRegion, region)
+	})
+
+	t.Run("with_specified_region", func(t *testing.T) {
+		specifiedRegion := getRandomRegion()
+
+		// Even with environment region set differently, specified region should take precedence
+		t.Setenv("AWS_REGION", getRandomRegion())
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+
+		region, err := loadRegion(context.Background(), specifiedRegion)
+		require.NoError(t, err)
+		require.Equal(t, specifiedRegion, region)
+	})
+
+	t.Run("imds_fallback", func(t *testing.T) {
+		randomRegion := getRandomRegion()
+
+		// Mock IMDS server that returns a region
+		mockIMDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Handle instance identity document (contains region info)
+			if r.URL.Path == "/latest/dynamic/instance-identity/document" {
+				imdsPayload := `{"region": "` + randomRegion + `"}`
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(imdsPayload))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer mockIMDS.Close()
+
+		// Set up environment with no region but valid credentials
+		// This will force fallback to IMDS
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+		// Unset any existing region
+		t.Setenv("AWS_REGION", "")
+		t.Setenv("AWS_DEFAULT_REGION", "")
+		t.Setenv("AWS_CONFIG_FILE", "") // Ensure no config file is used
+		t.Setenv("AWS_PROFILE", "")     // Ensure no profile file is used
+		// Point IMDS to our mock server
+		t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", mockIMDS.URL)
+
+		region, err := loadRegion(context.Background(), "")
+		require.NoError(t, err)
+		require.Equal(t, randomRegion, region)
+	})
+
+	t.Run("imds_empty_region", func(t *testing.T) {
+		// Mock IMDS server that returns empty region
+		mockIMDS := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// Handle instance identity document with empty region
+			if r.URL.Path == "/latest/dynamic/instance-identity/document" {
+				imdsPayload := `{"region": ""}`
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusOK)
+				w.Write([]byte(imdsPayload))
+				return
+			}
+			w.WriteHeader(http.StatusNotFound)
+		}))
+		defer mockIMDS.Close()
+
+		// Set up environment with no region but valid credentials
+		t.Setenv("AWS_ACCESS_KEY_ID", "dummy")
+		t.Setenv("AWS_SECRET_ACCESS_KEY", "dummy")
+		// Unset any existing region
+		t.Setenv("AWS_REGION", "")
+		t.Setenv("AWS_DEFAULT_REGION", "")
+		t.Setenv("AWS_CONFIG_FILE", "") // Ensure no config file is used
+		t.Setenv("AWS_PROFILE", "")     // Ensure no profile file is used
+		// Point IMDS to our mock server
+		t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", mockIMDS.URL)
+
+		_, err := loadRegion(context.Background(), "")
+		require.Error(t, err)
+		require.Contains(t, err.Error(), "failed to get region from IMDS")
+	})
+}
+
+// Regression test for issue #6092: parsing an AWS SD config must not call
+// IMDS even when the region is omitted.
+func TestAWSSDConfigUnmarshalYAML_NoRegionResolution(t *testing.T) {
+	// Point IMDS at a black hole and wipe every other region source so any
+	// accidental loadRegion call fails fast instead of waiting on IMDS.
+	t.Setenv("AWS_EC2_METADATA_SERVICE_ENDPOINT", "http://127.0.0.1:1")
+	t.Setenv("AWS_REGION", "")
+	t.Setenv("AWS_DEFAULT_REGION", "")
+	t.Setenv("AWS_CONFIG_FILE", "")
+	t.Setenv("AWS_PROFILE", "")
+
+	yamls := map[string]string{
+		"ec2":         `region: ""`,
+		"ecs":         `region: ""`,
+		"rds":         `region: ""`,
+		"msk":         `region: ""`,
+		"elasticache": `region: ""`,
+		"lightsail":   `region: ""`,
+	}
+
+	for role, body := range yamls {
+		t.Run(role, func(t *testing.T) {
+			yamlStr := "role: " + role + "\n" + body + "\n"
+			cfg := SDConfig{}
+			err := yaml.Unmarshal([]byte(yamlStr), &cfg)
+			require.NoError(t, err, "config parsing must not make network calls")
+			require.Empty(t, cfg.Region, "region must remain empty after parse; resolution is deferred to SD init")
+		})
+	}
+}
+
+func TestSDConfigSetDirectory(t *testing.T) {
+	t.Parallel()
+	tmpDir := t.TempDir()
+	tests := []struct {
+		name string
+		yaml string
+		role Role
+	}{
+		{
+			name: "EC2",
+			yaml: `
+role: ec2
+region: us-east-1
+`,
+			role: RoleEC2,
+		},
+		{
+			name: "ECS",
+			yaml: `
+role: ecs
+region: us-west-2
+clusters: [test-cluster]
+`,
+			role: RoleECS,
+		},
+		{
+			name: "Elasticache",
+			yaml: `
+role: elasticache
+region: eu-west-1
+`,
+			role: RoleElasticache,
+		},
+		{
+			name: "Lightsail",
+			yaml: `
+role: lightsail
+region: ap-south-1
+`,
+			role: RoleLightsail,
+		},
+		{
+			name: "MSK",
+			yaml: `
+role: msk
+region: us-east-2
+`,
+			role: RoleMSK,
+		},
+		{
+			name: "RDS",
+			yaml: `
+role: rds
+region: us-west-1
+`,
+			role: RoleRDS,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			var cfg SDConfig
+			err := yaml.Unmarshal([]byte(tt.yaml), &cfg)
+			require.NoError(t, err)
+			require.Equal(t, tt.role, cfg.Role)
+
+			// Call SetDirectory - should not panic
+			require.NotPanics(t, func() {
+				cfg.SetDirectory(tmpDir)
+			})
+		})
+	}
+
+	t.Run("SetDirectoryWithNilConfigs", func(t *testing.T) {
+		// Test that SetDirectory doesn't panic when called on an SDConfig
+		// where the role-specific config might be nil (this was the original bug)
+		cfg := SDConfig{
+			Role: RoleEC2,
+			// EC2SDConfig is nil - this would have caused a panic before the fix
+		}
+		// This should not panic
+		require.NotPanics(t, func() {
+			cfg.SetDirectory(tmpDir)
+		})
+	})
 }

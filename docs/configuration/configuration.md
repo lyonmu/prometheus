@@ -159,12 +159,6 @@ global:
   # native histogram with custom buckets.
   [ always_scrape_classic_histograms: <boolean> | default = false ]
 
-  # When enabled, Prometheus stores additional time series for each scrape:
-  # scrape_timeout_seconds, scrape_sample_limit, and scrape_body_size_bytes.
-  # These metrics help monitor how close targets are to their configured limits.
-  # This option can be overridden per scrape config.
-  [ extra_scrape_metrics: <boolean> | default = false ]
-
   # The following explains the various combinations of the last three options
   # in various exposition cases.
   #
@@ -200,6 +194,12 @@ global:
   # convert_classic_histograms_to_nhcb is set to (it would collide with the
   # actual native histogram). However, there will be a classic histogram if (and
   # only if) always_scrape_classic_histograms is set to true.
+
+  # When enabled, Prometheus stores additional time series for each scrape:
+  # scrape_timeout_seconds, scrape_sample_limit, and scrape_body_size_bytes.
+  # These metrics help monitor how close targets are to their configured limits.
+  # This option can be overridden per scrape config.
+  [ extra_scrape_metrics: <boolean> | default = false ]
 
 runtime:
   # Configure the Go garbage collector GOGC parameter
@@ -486,9 +486,17 @@ nerve_sd_configs:
 nomad_sd_configs:
   [ - <nomad_sd_config> ... ]
 
+# List of OCI service discovery configurations.
+oci_sd_configs:
+  [ - <oci_sd_config> ... ]
+
 # List of OpenStack service discovery configurations.
 openstack_sd_configs:
   [ - <openstack_sd_config> ... ]
+
+# List of Outscale service discovery configurations.
+outscale_sd_configs:
+  [ - <outscale_sd_config> ... ]
 
 # List of OVHcloud service discovery configurations.
 ovhcloud_sd_configs:
@@ -653,14 +661,14 @@ metric_relabel_configs:
 # native histogram with custom buckets.
 [ always_scrape_classic_histograms: <boolean> | default = <global.always_scrape_classic_histograms> ]
 
+# See global configuration above for further explanations of how the last three
+# options combine their effects.
+
 # When enabled, Prometheus stores additional time series for this scrape job:
 # scrape_timeout_seconds, scrape_sample_limit, and scrape_body_size_bytes.
 # These metrics help monitor how close targets are to their configured limits.
 # If not set, inherits the value from the global configuration.
 [ extra_scrape_metrics: <boolean> | default = <global.extra_scrape_metrics> ]
-
-# See global configuration above for further explanations of how the last three
-# options combine their effects.
 
 ```
 
@@ -714,7 +722,7 @@ tls_config:
 # that should be excluded from proxying. IP and domain names can
 # contain port numbers.
 [ no_proxy: <string> ]
-# Use proxy URL indicated by environment variables (HTTP_PROXY, https_proxy, HTTPs_PROXY, https_proxy, and no_proxy)
+# Use proxy URL indicated by environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, and their lowercase versions)
 [ proxy_from_environment: <boolean> | default: false ]
 # Specifies headers to send to proxies during CONNECT requests.
 [ proxy_connect_header:
@@ -849,23 +857,11 @@ tls_config:
 # that should be excluded from proxying. IP and domain names can
 # contain port numbers.
 [ no_proxy: <string> ]
-# Use proxy URL indicated by environment variables (HTTP_PROXY, https_proxy, HTTPs_PROXY, https_proxy, and no_proxy)
+# Use proxy URL indicated by environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, and their lowercase versions)
 [ proxy_from_environment: <boolean> | default: false ]
 # Specifies headers to send to proxies during CONNECT requests.
 [ proxy_connect_header:
   [ <string>: [<secret>, ...] ] ]
-
-# Custom HTTP headers to be sent along with each request.
-# Headers that are set by Prometheus itself can't be overwritten.
-http_headers:
-  # Header name.
-  [ <string>:
-    # Header values.
-    [ values: [<string>, ...] ]
-    # Headers values. Hidden in configuration page.
-    [ secrets: [<secret>, ...] ]
-    # Files to read header values from.
-    [ files: [<string>, ...] ] ]
 ```
 
 ### `<aws_sd_config>`
@@ -898,6 +894,7 @@ The following meta labels are available on targets during [relabeling](#relabel_
 * `__meta_ec2_ipv6_addresses`: comma separated list of IPv6 addresses assigned to the instance's network interfaces, if present
 * `__meta_ec2_owner_id`: the ID of the AWS account that owns the EC2 instance
 * `__meta_ec2_platform`: the Operating System platform, set to 'windows' on Windows servers, absent otherwise
+* `__meta_ec2_default_ipv6_address`: the first primary IPv6 address found if present, otherwise first non-primary IPv6 address, if present
 * `__meta_ec2_primary_ipv6_addresses`: comma separated list of the Primary IPv6 addresses of the instance, if present. The list is ordered based on the position of each corresponding network interface in the attachment order.
 * `__meta_ec2_primary_subnet_id`: the subnet ID of the primary network interface, if available
 * `__meta_ec2_private_dns_name`: the private DNS name of the instance, if available
@@ -984,11 +981,328 @@ The following meta labels are available on targets during [relabeling](#relabel_
 * `__meta_ecs_tag_task_<tagkey>`: each task tag value, keyed by tag name
 * `__meta_ecs_tag_ec2_<tagkey>`: each EC2 instance tag value, keyed by tag name (EC2 launch type only)
 
+#### `msk`
+
+The `msk` role discovers targets from AWS MSK (Managed Streaming for Apache Kafka) provisioned clusters.
+
+**Important**: This service discovery only works with **provisioned clusters**. Serverless clusters are not supported as they do not expose individual broker nodes.
+
+Discovery includes:
+- **Broker nodes**: Kafka broker instances (supports both ZooKeeper-based and KRaft-based clusters)
+- **KRaft Controller nodes**: Controller instances (KRaft-based clusters only)
+
+Note: ZooKeeper nodes are not discoverable via the MSK API. For monitoring, MSK provides:
+- **JMX Exporter**: Available on both broker and KRaft controller nodes (when enabled)
+- **Node Exporter**: Available on broker nodes only (when enabled)
+
+The IAM credentials used must have the following permissions to discover
+scrape targets:
+
+- `kafka:DescribeClusterV2`
+- `kafka:ListClustersV2`
+- `kafka:ListNodes`
+
+The following meta labels are available on targets during [relabeling](#relabel_config):
+
+* `__meta_msk_cluster_name`: the name of the MSK cluster
+* `__meta_msk_cluster_arn`: the ARN of the MSK cluster
+* `__meta_msk_cluster_state`: the state of the MSK cluster (e.g., ACTIVE, CREATING, DELETING)
+* `__meta_msk_cluster_type`: the type of the MSK cluster (e.g., PROVISIONED, SERVERLESS)
+* `__meta_msk_cluster_version`: the current version of the MSK cluster
+* `__meta_msk_cluster_kafka_version`: the Kafka version running on the cluster
+* `__meta_msk_cluster_jmx_exporter_enabled`: whether JMX exporter is enabled on the cluster
+* `__meta_msk_cluster_configuration_arn`: the ARN of the MSK configuration
+* `__meta_msk_cluster_configuration_revision`: the revision of the MSK configuration
+* `__meta_msk_cluster_tag_<tagkey>`: each cluster tag value, keyed by tag name
+* `__meta_msk_node_type`: the type of the node (BROKER or CONTROLLER)
+* `__meta_msk_node_arn`: the ARN of the node
+* `__meta_msk_node_added_time`: the time the node was added to the cluster
+* `__meta_msk_node_instance_type`: the instance type of the node
+* `__meta_msk_node_attached_eni`: the ID of the attached ENI
+* `__meta_msk_broker_id`: the broker ID (broker nodes only)
+* `__meta_msk_broker_endpoint_index`: the index of the broker endpoint (broker nodes only)
+* `__meta_msk_broker_client_subnet`: the client subnet of the broker (broker nodes only)
+* `__meta_msk_broker_client_vpc_ip`: the VPC IP address of the broker (broker nodes only)
+* `__meta_msk_broker_node_exporter_enabled`: whether node exporter is enabled on brokers (broker nodes only)
+* `__meta_msk_controller_endpoint_index`: the index of the controller endpoint (controller nodes only)
+
+#### `elasticache`
+
+The `elasticache` role discovers targets from AWS ElastiCache for both serverless caches and cache clusters.
+
+**Important**: For cache clusters, one target is created per cache node. Each target includes the cluster-level labels (ARN, status, tags, etc.) and node-specific labels (node ID, endpoint, availability zone, etc.). The `__address__` label is set to the individual node's endpoint address and port.
+
+For serverless caches, one target is created per serverless cache, with the `__address__` label set to the serverless cache endpoint.
+
+The IAM credentials used must have the following permissions to discover scrape targets:
+
+- `elasticache:DescribeServerlessCaches`
+- `elasticache:DescribeCacheClusters`
+- `elasticache:ListTagsForResource`
+
+The following meta labels are available on targets during [relabeling](#relabel_config):
+
+**Common labels (available on all targets):**
+
+* `__meta_elasticache_deployment_option`: the deployment option - either `serverless` for serverless caches or `node` for cache cluster nodes
+
+**Serverless Cache labels:**
+
+* `__meta_elasticache_serverless_cache_arn`: the ARN of the serverless cache
+* `__meta_elasticache_serverless_cache_name`: the name of the serverless cache
+* `__meta_elasticache_serverless_cache_status`: the status of the serverless cache
+* `__meta_elasticache_serverless_cache_engine`: the cache engine (redis or valkey)
+* `__meta_elasticache_serverless_cache_full_engine_version`: the full engine version
+* `__meta_elasticache_serverless_cache_major_engine_version`: the major engine version
+* `__meta_elasticache_serverless_cache_description`: the description of the serverless cache
+* `__meta_elasticache_serverless_cache_create_time`: the creation time in RFC3339 format
+* `__meta_elasticache_serverless_cache_snapshot_retention_limit`: the snapshot retention limit in days
+* `__meta_elasticache_serverless_cache_daily_snapshot_time`: the daily snapshot time
+* `__meta_elasticache_serverless_cache_user_group_id`: the user group ID
+* `__meta_elasticache_serverless_cache_kms_key_id`: the KMS key ID for encryption at rest
+* `__meta_elasticache_serverless_cache_endpoint_address`: the endpoint address
+* `__meta_elasticache_serverless_cache_endpoint_port`: the endpoint port
+* `__meta_elasticache_serverless_cache_reader_endpoint_address`: the reader endpoint address
+* `__meta_elasticache_serverless_cache_reader_endpoint_port`: the reader endpoint port
+* `__meta_elasticache_serverless_cache_security_group_id_<index>`: security group IDs (indexed)
+* `__meta_elasticache_serverless_cache_subnet_id_<index>`: subnet IDs (indexed)
+* `__meta_elasticache_serverless_cache_cache_usage_limit_data_storage_maximum`: maximum data storage in the specified unit
+* `__meta_elasticache_serverless_cache_cache_usage_limit_data_storage_minimum`: minimum data storage in the specified unit
+* `__meta_elasticache_serverless_cache_cache_usage_limit_data_storage_unit`: unit for data storage (e.g., GB)
+* `__meta_elasticache_serverless_cache_cache_usage_limit_ecpu_per_second_maximum`: maximum ECPU per second
+* `__meta_elasticache_serverless_cache_cache_usage_limit_ecpu_per_second_minimum`: minimum ECPU per second
+* `__meta_elasticache_serverless_cache_tag_<tagkey>`: each serverless cache tag value, keyed by tag name
+
+**Cache Cluster labels:**
+
+* `__meta_elasticache_cache_cluster_arn`: the ARN of the cache cluster
+* `__meta_elasticache_cache_cluster_cache_cluster_id`: the cache cluster ID
+* `__meta_elasticache_cache_cluster_cache_cluster_status`: the status of the cache cluster
+* `__meta_elasticache_cache_cluster_engine`: the cache engine (redis or memcached)
+* `__meta_elasticache_cache_cluster_engine_version`: the engine version
+* `__meta_elasticache_cache_cluster_cache_node_type`: the cache node type (e.g., cache.t3.micro)
+* `__meta_elasticache_cache_cluster_num_cache_nodes`: the number of cache nodes
+* `__meta_elasticache_cache_cluster_cache_cluster_create_time`: the creation time in RFC3339 format
+* `__meta_elasticache_cache_cluster_at_rest_encryption_enabled`: whether encryption at rest is enabled
+* `__meta_elasticache_cache_cluster_transit_encryption_enabled`: whether encryption in transit is enabled
+* `__meta_elasticache_cache_cluster_transit_encryption_mode`: the transit encryption mode
+* `__meta_elasticache_cache_cluster_auth_token_enabled`: whether auth token is enabled
+* `__meta_elasticache_cache_cluster_auth_token_last_modified`: the last modification time of auth token
+* `__meta_elasticache_cache_cluster_auto_minor_version_upgrade`: whether auto minor version upgrade is enabled
+* `__meta_elasticache_cache_cluster_cache_parameter_group`: the cache parameter group name
+* `__meta_elasticache_cache_cluster_cache_subnet_group_name`: the cache subnet group name
+* `__meta_elasticache_cache_cluster_client_download_landing_page`: the client download landing page URL
+* `__meta_elasticache_cache_cluster_ip_discovery`: the IP discovery mode (ipv4 or ipv6)
+* `__meta_elasticache_cache_cluster_network_type`: the network type (ipv4, ipv6, or dual_stack)
+* `__meta_elasticache_cache_cluster_preferred_availability_zone`: the preferred availability zone
+* `__meta_elasticache_cache_cluster_preferred_maintenance_window`: the preferred maintenance window
+* `__meta_elasticache_cache_cluster_preferred_outpost_arn`: the preferred outpost ARN
+* `__meta_elasticache_cache_cluster_replication_group_id`: the replication group ID (for Redis clusters that are part of a replication group)
+* `__meta_elasticache_cache_cluster_replication_group_log_delivery_enabled`: whether log delivery is enabled for the replication group
+* `__meta_elasticache_cache_cluster_snapshot_retention_limit`: the snapshot retention limit in days
+* `__meta_elasticache_cache_cluster_snapshot_window`: the daily snapshot window
+* `__meta_elasticache_cache_cluster_configuration_endpoint_address`: the configuration endpoint address (cluster mode enabled only)
+* `__meta_elasticache_cache_cluster_configuration_endpoint_port`: the configuration endpoint port (cluster mode enabled only)
+* `__meta_elasticache_cache_cluster_notification_topic_arn`: the SNS topic ARN for notifications
+* `__meta_elasticache_cache_cluster_notification_topic_status`: the SNS topic status
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_destination_type_<index>`: log delivery destination type (cloudwatch-logs or kinesis-firehose)
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_log_format_<index>`: log format (text or json)
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_log_type_<index>`: log type (slow-log or engine-log)
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_status_<index>`: log delivery status
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_message_<index>`: log delivery message
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_log_group_<index>`: CloudWatch log group name (cloudwatch-logs destination only)
+* `__meta_elasticache_cache_cluster_log_delivery_configuration_delivery_stream_<index>`: Kinesis Firehose delivery stream name (kinesis-firehose destination only)
+* `__meta_elasticache_cache_cluster_pending_modified_values_auth_token_status`: pending auth token status
+* `__meta_elasticache_cache_cluster_pending_modified_values_cache_node_type`: pending cache node type change
+* `__meta_elasticache_cache_cluster_pending_modified_values_engine_version`: pending engine version upgrade
+* `__meta_elasticache_cache_cluster_pending_modified_values_num_cache_nodes`: pending number of cache nodes
+* `__meta_elasticache_cache_cluster_pending_modified_values_transit_encryption_enabled`: pending transit encryption status
+* `__meta_elasticache_cache_cluster_pending_modified_values_transit_encryption_mode`: pending transit encryption mode
+* `__meta_elasticache_cache_cluster_pending_modified_values_cache_node_ids_to_remove`: comma-separated list of cache node IDs to be removed
+* `__meta_elasticache_cache_cluster_security_group_membership_id_<index>`: security group ID (indexed)
+* `__meta_elasticache_cache_cluster_security_group_membership_status_<index>`: security group status (indexed)
+* `__meta_elasticache_cache_cluster_node_id`: cache node ID
+* `__meta_elasticache_cache_cluster_node_status`: cache node status
+* `__meta_elasticache_cache_cluster_node_create_time`: cache node creation time in RFC3339 format
+* `__meta_elasticache_cache_cluster_node_availability_zone`: cache node availability zone
+* `__meta_elasticache_cache_cluster_node_customer_outpost_arn`: cache node outpost ARN
+* `__meta_elasticache_cache_cluster_node_source_cache_node_id`: source cache node ID for replication
+* `__meta_elasticache_cache_cluster_node_parameter_group_status`: parameter group status
+* `__meta_elasticache_cache_cluster_node_endpoint_address`: cache node endpoint address
+* `__meta_elasticache_cache_cluster_node_endpoint_port`: cache node endpoint port
+* `__meta_elasticache_cache_cluster_tag_<tagkey>`: each cache cluster tag value, keyed by tag name
+
+#### `rds`
+
+The `rds` role discovers targets from [AWS RDS](https://aws.amazon.com/rds/)
+database instances within clusters. One target is created for each DB instance
+within the specified clusters. The endpoint address and port of each instance is used by default.
+
+The IAM credentials used must have the `rds:DescribeDBClusters` and `rds:DescribeDBInstances`
+permissions to discover scrape targets.
+
+The following meta labels are available on targets during [relabeling](#relabel_config):
+
+**Cluster labels:**
+
+* `__meta_rds_cluster_activity_stream_kinesis_stream_name`: the name of the Amazon Kinesis data stream used for database activity stream
+* `__meta_rds_cluster_activity_stream_kms_key_id`: the AWS KMS key identifier used for encrypting the database activity stream
+* `__meta_rds_cluster_activity_stream_mode`: the mode of the database activity stream (sync or async)
+* `__meta_rds_cluster_activity_stream_status`: the status of the database activity stream
+* `__meta_rds_cluster_allocated_storage`: the allocated storage size in gibibytes (GiB)
+* `__meta_rds_cluster_arn`: the Amazon Resource Name (ARN) of the DB cluster
+* `__meta_rds_cluster_auto_minor_version_upgrade`: whether automatic minor version upgrades are enabled
+* `__meta_rds_cluster_automatic_restart_time`: the time when a stopped cluster will be automatically restarted
+* `__meta_rds_cluster_aws_backup_recovery_point_arn`: the ARN of the recovery point in AWS Backup
+* `__meta_rds_cluster_backtrack_consumed_change_records`: the number of change records stored for backtrack
+* `__meta_rds_cluster_backtrack_window`: the target backtrack window in hours
+* `__meta_rds_cluster_backup_retention_period`: the number of days for which automated backups are retained
+* `__meta_rds_cluster_capacity`: the current capacity of an Aurora Serverless DB cluster
+* `__meta_rds_cluster_character_set_name`: the name of the character set
+* `__meta_rds_cluster_clone_group_id`: the ID of the clone group
+* `__meta_rds_cluster_cluster_create_time`: the time when the DB cluster was created
+* `__meta_rds_cluster_cluster_scalability_type`: the scalability type of the cluster
+* `__meta_rds_cluster_copy_tags_to_snapshot`: whether tags are copied from the cluster to snapshots
+* `__meta_rds_cluster_cross_account_clone`: whether the DB cluster is a cross-account clone
+* `__meta_rds_cluster_database_insights_mode`: the mode of Database Insights
+* `__meta_rds_cluster_database_name`: the database name
+* `__meta_rds_cluster_db_system_id`: the Oracle system ID (Oracle SID)
+* `__meta_rds_cluster_deletion_protection`: whether deletion protection is enabled
+* `__meta_rds_cluster_earliest_backtrack_time`: the earliest time to which a database can be restored with backtrack
+* `__meta_rds_cluster_earliest_restorable_time`: the earliest time to which a database can be restored
+* `__meta_rds_cluster_endpoint`: the endpoint of the DB cluster
+* `__meta_rds_cluster_engine_lifecycle_support`: the engine lifecycle support value
+* `__meta_rds_cluster_engine_mode`: the engine mode of the cluster (provisioned, serverless, etc.)
+* `__meta_rds_cluster_engine_version`: the version of the database engine
+* `__meta_rds_cluster_engine`: the database engine of the DB cluster
+* `__meta_rds_cluster_global_cluster_identifier`: the identifier of the global cluster
+* `__meta_rds_cluster_global_write_forwarding_requested`: whether global write forwarding is requested
+* `__meta_rds_cluster_global_write_forwarding_status`: the status of global write forwarding
+* `__meta_rds_cluster_hosted_zone_id`: the Route 53 hosted zone ID
+* `__meta_rds_cluster_http_endpoint_enabled`: whether the HTTP endpoint is enabled
+* `__meta_rds_cluster_iam_database_authentication_enabled`: whether the DB cluster has IAM database authentication enabled
+* `__meta_rds_cluster_identifier`: the identifier of the DB cluster
+* `__meta_rds_cluster_instance_class`: the compute and memory capacity class of the DB cluster
+* `__meta_rds_cluster_io_optimized_next_allowed_modification_time`: the time when the next IO optimization configuration change is allowed
+* `__meta_rds_cluster_iops`: the provisioned IOPS (I/O operations per second) value
+* `__meta_rds_cluster_kms_key_id`: the AWS KMS key identifier for the encrypted cluster
+* `__meta_rds_cluster_latest_restorable_time`: the latest time to which a database can be restored
+* `__meta_rds_cluster_local_write_forwarding_status`: the status of local write forwarding
+* `__meta_rds_cluster_master_username`: the master username
+* `__meta_rds_cluster_monitoring_interval`: the interval in seconds between enhanced monitoring metrics collection
+* `__meta_rds_cluster_monitoring_role_arn`: the ARN for the IAM role that permits RDS to send enhanced monitoring metrics to CloudWatch
+* `__meta_rds_cluster_multi_az`: whether the DB cluster is multi-AZ
+* `__meta_rds_cluster_network_type`: the network type (IPV4 or DUAL)
+* `__meta_rds_cluster_parameter_group`: the name of the DB cluster parameter group
+* `__meta_rds_cluster_percent_progress`: the progress percentage of the DB cluster operation
+* `__meta_rds_cluster_performance_insights_enabled`: whether Performance Insights is enabled
+* `__meta_rds_cluster_performance_insights_kms_key_id`: the AWS KMS key identifier for encrypting Performance Insights data
+* `__meta_rds_cluster_performance_insights_retention_period`: the retention period for Performance Insights data
+* `__meta_rds_cluster_port`: the port the DB cluster is listening on
+* `__meta_rds_cluster_preferred_backup_window`: the daily time range during which automated backups are created
+* `__meta_rds_cluster_preferred_maintenance_window`: the weekly time range during which system maintenance can occur
+* `__meta_rds_cluster_publicly_accessible`: whether the DB cluster is publicly accessible
+* `__meta_rds_cluster_reader_endpoint`: the reader endpoint of the DB cluster
+* `__meta_rds_cluster_replication_source_identifier`: the identifier of the source DB cluster if this is a read replica
+* `__meta_rds_cluster_resource_id`: the AWS Region-unique immutable identifier for the DB cluster
+* `__meta_rds_cluster_serverless_v2_platform_version`: the platform version of the Aurora Serverless v2 DB cluster
+* `__meta_rds_cluster_status`: the status of the DB cluster
+* `__meta_rds_cluster_storage_encrypted`: whether the DB cluster is storage encrypted
+* `__meta_rds_cluster_storage_encryption_type`: the storage encryption type
+* `__meta_rds_cluster_storage_throughput`: the storage throughput in MiBps
+* `__meta_rds_cluster_storage_type`: the storage type
+* `__meta_rds_cluster_subnet_group`: the name of the subnet group associated with the DB cluster
+* `__meta_rds_cluster_tag_<tagkey>`: each tag value of the DB cluster
+* `__meta_rds_cluster_upgrade_rollout_order`: the upgrade rollout order
+
+**Instance labels:**
+
+* `__meta_rds_instance_activity_stream_engine_native_audit_fields_included`: whether engine-native audit fields are included in the database activity stream
+* `__meta_rds_instance_activity_stream_kinesis_stream_name`: the name of the Amazon Kinesis data stream used for the database activity stream
+* `__meta_rds_instance_activity_stream_kms_key_id`: the AWS KMS key identifier used for encrypting the database activity stream
+* `__meta_rds_instance_activity_stream_mode`: the mode of the database activity stream (sync or async)
+* `__meta_rds_instance_activity_stream_policy_status`: the policy status of the database activity stream
+* `__meta_rds_instance_activity_stream_status`: the status of the database activity stream
+* `__meta_rds_instance_allocated_storage`: the allocated storage size in gibibytes (GiB)
+* `__meta_rds_instance_arn`: the Amazon Resource Name (ARN) of the DB instance
+* `__meta_rds_instance_auto_minor_version_upgrade`: whether automatic minor version upgrades are enabled
+* `__meta_rds_instance_automatic_restart_time`: the time when a stopped instance will be automatically restarted
+* `__meta_rds_instance_automation_mode`: the automation mode of the instance
+* `__meta_rds_instance_availability_zone`: the availability zone of the DB instance
+* `__meta_rds_instance_aws_backup_recovery_point_arn`: the ARN of the recovery point in AWS Backup
+* `__meta_rds_instance_backup_retention_period`: the number of days for which automated backups are retained
+* `__meta_rds_instance_backup_target`: the backup target (region or outposts)
+* `__meta_rds_instance_ca_certificate_identifier`: the identifier of the CA certificate for the DB instance
+* `__meta_rds_instance_character_set_name`: the name of the character set
+* `__meta_rds_instance_class`: the compute and memory capacity class of the DB instance
+* `__meta_rds_instance_copy_tags_to_snapshot`: whether tags are copied from the instance to snapshots
+* `__meta_rds_instance_custom_iam_instance_profile`: the instance profile associated with the underlying Amazon EC2 instance
+* `__meta_rds_instance_customer_owned_ip_enabled`: whether a customer-owned IP address (CoIP) is enabled
+* `__meta_rds_instance_database_insights_mode`: the mode of Database Insights
+* `__meta_rds_instance_db_cluster_identifier`: the identifier of the DB cluster this instance is a member of
+* `__meta_rds_instance_db_name`: the database name
+* `__meta_rds_instance_db_system_id`: the Oracle system ID (Oracle SID)
+* `__meta_rds_instance_dedicated_log_volume`: whether the DB instance has a dedicated log volume
+* `__meta_rds_instance_deletion_protection`: whether deletion protection is enabled
+* `__meta_rds_instance_endpoint_address`: the DNS address of the DB instance
+* `__meta_rds_instance_endpoint_hosted_zone_id`: the Route 53 hosted zone ID of the endpoint
+* `__meta_rds_instance_endpoint_port`: the port that the DB instance listens on
+* `__meta_rds_instance_engine_lifecycle_support`: the engine lifecycle support value
+* `__meta_rds_instance_engine_version`: the version of the database engine
+* `__meta_rds_instance_engine`: the database engine that the DB instance uses
+* `__meta_rds_instance_enhanced_monitoring_resource_arn`: the ARN of the Amazon CloudWatch Logs log stream for enhanced monitoring
+* `__meta_rds_instance_iam_database_authentication_enabled`: whether IAM database authentication is enabled
+* `__meta_rds_instance_identifier`: the identifier of the DB instance
+* `__meta_rds_instance_instance_create_time`: the time when the DB instance was created
+* `__meta_rds_instance_iops`: the provisioned IOPS (I/O operations per second) value
+* `__meta_rds_instance_is_cluster_writer`: whether the instance is the cluster writer (true/false)
+* `__meta_rds_instance_is_storage_config_upgrade_available`: whether a storage configuration upgrade is available
+* `__meta_rds_instance_kms_key_id`: the AWS KMS key identifier for the encrypted instance
+* `__meta_rds_instance_latest_restorable_time`: the latest time to which a database can be restored
+* `__meta_rds_instance_license_model`: the license model information
+* `__meta_rds_instance_listener_endpoint_address`: the DNS address of the listener endpoint
+* `__meta_rds_instance_listener_endpoint_hosted_zone_id`: the Route 53 hosted zone ID of the listener endpoint
+* `__meta_rds_instance_listener_endpoint_port`: the port that the listener endpoint listens on
+* `__meta_rds_instance_master_username`: the master username
+* `__meta_rds_instance_max_allocated_storage`: the upper limit in gibibytes to which storage can be scaled automatically
+* `__meta_rds_instance_monitoring_interval`: the interval in seconds between enhanced monitoring metrics collection
+* `__meta_rds_instance_monitoring_role_arn`: the ARN for the IAM role that permits RDS to send enhanced monitoring metrics to CloudWatch
+* `__meta_rds_instance_multi_az`: whether the DB instance is a Multi-AZ deployment
+* `__meta_rds_instance_multi_tenant`: whether the instance is in a multi-tenant configuration
+* `__meta_rds_instance_nchar_character_set_name`: the national character set name
+* `__meta_rds_instance_network_type`: the network type (IPV4 or DUAL)
+* `__meta_rds_instance_percent_progress`: the progress percentage of the DB instance operation
+* `__meta_rds_instance_performance_insights_enabled`: whether Performance Insights is enabled
+* `__meta_rds_instance_performance_insights_kms_key_id`: the AWS KMS key identifier for encrypting Performance Insights data
+* `__meta_rds_instance_performance_insights_retention_period`: the retention period for Performance Insights data
+* `__meta_rds_instance_port`: the port that the DB instance listens on
+* `__meta_rds_instance_preferred_backup_window`: the daily time range during which automated backups are created
+* `__meta_rds_instance_preferred_maintenance_window`: the weekly time range during which system maintenance can occur
+* `__meta_rds_instance_promotion_tier`: the order in which an Aurora replica is promoted to primary instance after a failure
+* `__meta_rds_instance_publicly_accessible`: whether the DB instance is publicly accessible
+* `__meta_rds_instance_read_replica_source_db_cluster_identifier`: the identifier of the source DB cluster if this instance is a read replica
+* `__meta_rds_instance_read_replica_source_db_instance_identifier`: the identifier of the source DB instance if this instance is a read replica
+* `__meta_rds_instance_replica_mode`: the replica mode (open-read-only or mounted)
+* `__meta_rds_instance_resource_id`: the AWS Region-unique immutable identifier for the DB instance
+* `__meta_rds_instance_resume_full_automation_mode_time`: the time when the DB instance will resume full automation
+* `__meta_rds_instance_secondary_availability_zone`: the secondary availability zone for Multi-AZ instances
+* `__meta_rds_instance_status`: the status of the DB instance
+* `__meta_rds_instance_storage_encrypted`: whether the DB instance is storage encrypted
+* `__meta_rds_instance_storage_encryption_type`: the storage encryption type
+* `__meta_rds_instance_storage_throughput`: the storage throughput in MiBps
+* `__meta_rds_instance_storage_type`: the storage type
+* `__meta_rds_instance_storage_volume_status`: the status of the storage volume
+* `__meta_rds_instance_subnet_group`: the name of the subnet group associated with the DB instance
+* `__meta_rds_instance_tag_<tagkey>`: each tag value of the DB instance
+* `__meta_rds_instance_tde_credential_arn`: the ARN for the TDE encryption key
+* `__meta_rds_instance_timezone`: the time zone of the DB instance
+* `__meta_rds_instance_upgrade_rollout_order`: the upgrade rollout order
+
 See below for the configuration options for AWS discovery:
 
 ```yaml
 # The AWS role to use for service discovery.
-# Must be one of: ec2, lightsail, or ecs.
+# Must be one of: ec2, lightsail, ecs, msk, elasticache, or rds.
 role: <string>
 
 # The AWS region. If blank, the region from the instance metadata is used.
@@ -1009,6 +1323,9 @@ role: <string>
 # AWS Role ARN, an alternative to using AWS API keys.
 [ role_arn: <string> ]
 
+# Optional External ID that can go along with role_arn.
+[ external_id: <string> ]
+
 # Refresh interval to re-read the targets list.
 [ refresh_interval: <duration> | default = 60s ]
 
@@ -1016,16 +1333,21 @@ role: <string>
 # instead be specified in the relabeling rule.
 [ port: <int> | default = 80 ]
 
-# Filters can be used optionally to filter the instance list by other criteria (ec2 role only).
+# Filters can be used optionally to filter the instance list by other criteria (ec2 & rds role only).
 # Available filter criteria can be found here:
-# https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeInstances.html
-# Filter API documentation: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_Filter.html
+# EC2:
+#  - https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_DescribeInstances.html
+#  - Filter API documentation: https://docs.aws.amazon.com/AWSEC2/latest/APIReference/API_Filter.html
+# RDS:
+#  - https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_DescribeDBInstances.html
+#  - Filter API documentation: https://docs.aws.amazon.com/AmazonRDS/latest/APIReference/API_Filter.html
 filters:
   [ - name: <string>
       values: <string>, [...] ]
 
-# List of ECS cluster ARNs to discover (ecs role only). If empty, all clusters in the region are discovered.
-# This can significantly improve performance when you only need to monitor specific clusters.
+# List of ECS, ElastiCache, MSK, or RDS cluster identifiers (ecs, elasticache, msk, and rds roles only) to discover.
+# A List of ARNs of clusters to discover. If empty, all clusters in the region are discovered.
+# This can significantly improve performance when you only need to monitor specific clusters/caches.
 [ clusters: [<string>, ...] ]
 
 # HTTP client settings, including authentication methods (such as basic auth and
@@ -1055,7 +1377,7 @@ The following meta labels are available on targets during [relabeling](#relabel_
 * `__meta_azure_machine_public_ip`: the machine's public IP if it exists
 * `__meta_azure_machine_resource_group`: the machine's resource group
 * `__meta_azure_machine_tag_<tagname>`: each tag value of the machine
-* `__meta_azure_machine_scale_set`: the name of the scale set which the vm is part of (this value is only set if you are using a [scale set](https://docs.microsoft.com/en-us/azure/virtual-machine-scale-sets/))
+* `__meta_azure_machine_scale_set`: the name of the scale set which the vm is part of (this value is only set if you are using a [scale set](https://learn.microsoft.com/en-us/azure/virtual-machine-scale-sets/))
 * `__meta_azure_machine_size`: the machine size
 * `__meta_azure_subscription_id`: the subscription ID
 * `__meta_azure_tenant_id`: the tenant ID
@@ -1067,10 +1389,14 @@ See below for the configuration options for Azure discovery:
 # The Azure environment.
 [ environment: <string> | default = AzurePublicCloud ]
 
-# The authentication method, either OAuth, ManagedIdentity or SDK.
-# See https://docs.microsoft.com/en-us/azure/active-directory/managed-identities-azure-resources/overview
+# The authentication method, either OAuth, ManagedIdentity, SDK or WorkloadIdentity.
+# See https://learn.microsoft.com/en-us/entra/identity/managed-identities-azure-resources/overview
 # SDK authentication method uses environment variables by default.
 # See https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication
+# WorkloadIdentity authentication method uses the environment variables injected
+# by the Azure Workload Identity webhook (AZURE_CLIENT_ID, AZURE_TENANT_ID and
+# AZURE_FEDERATED_TOKEN_FILE).
+# See https://learn.microsoft.com/en-us/azure/aks/workload-identity-overview
 [ authentication_method: <string> | default = OAuth]
 # The subscription ID. Always required.
 subscription_id: <string>
@@ -1099,7 +1425,17 @@ subscription_id: <string>
 ### `<consul_sd_config>`
 
 Consul SD configurations allow retrieving scrape targets from [Consul's](https://www.consul.io)
-Catalog API.
+service catalog. Discovery uses two Consul API endpoints:
+
+1. The [Catalog API](https://developer.hashicorp.com/consul/api-docs/catalog) to list services
+   (used when `services` is empty, or when `tags` or `filter` are set).
+2. The [Health API](https://developer.hashicorp.com/consul/api-docs/health) to retrieve service
+   instances and their health status.
+
+Because these two APIs have different filtering field schemas, Prometheus exposes separate filter
+options for each: `filter` applies to the Catalog API and `health_filter` applies to the Health API.
+For example, tags are exposed as `ServiceTags` in the Catalog API but as `Service.Tags` in the
+Health API.
 
 The following meta labels are available on targets during [relabeling](#relabel_config):
 
@@ -1139,24 +1475,25 @@ The following meta labels are available on targets during [relabeling](#relabel_
 services:
   [ - <string> ]
 
-# A Consul Filter expression used to filter the catalog results
-# See https://www.consul.io/api-docs/catalog#list-services to know more
-# about the filter expressions that can be used.
+# Filter expression for the Catalog API. See https://developer.hashicorp.com/consul/api-docs/catalog#filtering for syntax.
 [ filter: <string> ]
 
-# The `tags` and `node_meta` fields are deprecated in Consul in favor of `filter`.
+# Filter expression for the Health API. See https://developer.hashicorp.com/consul/api-docs/health#filtering for syntax.
+[ health_filter: <string> ]
+
+# The `tags` and `node_meta` fields are deprecated in favor of `filter` and `health_filter`.
 # An optional list of tags used to filter nodes for a given service. Services must contain all tags in the list.
 tags:
   [ - <string> ]
 
-# Node metadata key/value pairs to filter nodes for a given service. As of Consul 1.14, consider `filter` instead.
+# Node metadata key/value pairs to filter nodes for a given service. As of Consul 1.14, consider `filter` or `health_filter` instead.
 [ node_meta:
   [ <string>: <string> ... ] ]
 
 # The string by which Consul tags are joined into the tag label.
 [ tag_separator: <string> | default = , ]
 
-# Allow stale Consul results (see https://www.consul.io/api/features/consistency.html). Will reduce load on Consul.
+# Allow stale Consul results (see https://developer.hashicorp.com/consul/api-docs/features/consistency). Will reduce load on Consul.
 [ allow_stale: <boolean> | default = true ]
 
 # The time after which the provided names are refreshed.
@@ -1183,10 +1520,15 @@ metadata and a single tag).
 ### `<digitalocean_sd_config>`
 
 DigitalOcean SD configurations allow retrieving scrape targets from [DigitalOcean's](https://www.digitalocean.com/)
-Droplets API.
-This service discovery uses the public IPv4 address by default, by that can be
-changed with relabeling, as demonstrated in [the Prometheus digitalocean-sd
-configuration file](/documentation/examples/prometheus-digitalocean.yml).
+API.
+This service discovery supports multiple roles through the `role` parameter.
+
+One of the following `role` types can be configured to discover targets:
+
+#### `droplets`
+
+The `droplets` role discovers targets from DigitalOcean Droplets. The public IPv4 address is used by default,
+but may be changed with relabeling.
 
 The following meta labels are available on targets during [relabeling](#relabel_config):
 
@@ -1204,11 +1546,33 @@ The following meta labels are available on targets during [relabeling](#relabel_
 * `__meta_digitalocean_tags`: the comma-separated list of tags of the droplet
 * `__meta_digitalocean_vpc`: the id of the droplet's VPC
 
+#### `databases`
+
+The `databases` role discovers targets from DigitalOcean Managed Databases.
+
+The following meta labels are available on targets during [relabeling](#relabel_config):
+
+* `__meta_digitalocean_db_id`: the id of the database cluster
+* `__meta_digitalocean_db_name`: the name of the database cluster
+* `__meta_digitalocean_db_engine`: the engine of the database cluster (e.g., `pg`, `mysql`, `redis`, `mongodb`)
+* `__meta_digitalocean_db_version`: the version of the engine
+* `__meta_digitalocean_db_status`: the status of the database cluster
+* `__meta_digitalocean_db_region`: the region of the database cluster
+* `__meta_digitalocean_db_size`: the size of the database cluster
+* `__meta_digitalocean_db_num_nodes`: the number of nodes in the database cluster
+* `__meta_digitalocean_db_host`: the public host of the database cluster
+* `__meta_digitalocean_db_private_host`: the private host of the database cluster
+* `__meta_digitalocean_db_tag_<tagname>`: each tag of the database cluster, with its value set to `true`
+
 ```yaml
+# The DigitalOcean role to use for service discovery.
+# Must be one of: droplets or databases.
+[ role: <string> | default = droplets ]
+
 # The port to scrape metrics from.
 [ port: <int> | default = 80 ]
 
-# The time after which the droplets are refreshed.
+# The time after which the targets are refreshed.
 [ refresh_interval: <duration> | default = 60s ]
 
 # HTTP client settings, including authentication methods (such as basic auth and
@@ -1469,6 +1833,7 @@ The following meta labels are available on targets during [relabeling](#relabel_
 * `__meta_ec2_ipv6_addresses`: comma separated list of IPv6 addresses assigned to the instance's network interfaces, if present
 * `__meta_ec2_owner_id`: the ID of the AWS account that owns the EC2 instance
 * `__meta_ec2_platform`: the Operating System platform, set to 'windows' on Windows servers, absent otherwise
+* `__meta_ec2_default_ipv6_address`: the first primary IPv6 address found if present, otherwise first non-primary IPv6 address, if present
 * `__meta_ec2_primary_ipv6_addresses`: comma separated list of the Primary IPv6 addresses of the instance, if present. The list is ordered based on the position of each corresponding network interface in the attachment order.
 * `__meta_ec2_primary_subnet_id`: the subnet ID of the primary network interface, if available
 * `__meta_ec2_private_dns_name`: the private DNS name of the instance, if available
@@ -1500,6 +1865,9 @@ See below for the configuration options for EC2 discovery:
 
 # AWS Role ARN, an alternative to using AWS API keys.
 [ role_arn: <string> ]
+
+# Optional External ID that can go along with role_arn.
+[ external_id: <string> ]
 
 # Refresh interval to re-read the instance list.
 [ refresh_interval: <duration> | default = 60s ]
@@ -1920,7 +2288,10 @@ The following meta labels are available on all targets during [relabeling](#rela
 * `__meta_hetzner_server_status`: the status of the server
 * `__meta_hetzner_public_ipv4`: the public ipv4 address of the server
 * `__meta_hetzner_public_ipv6_network`: the public ipv6 network (/64) of the server
-* `__meta_hetzner_datacenter`: the datacenter of the server
+
+Note that the `__meta_hetzner_datacenter` label is deprecated for both roles `robot` and `hcloud`:
+- For the `robot` role, the replacement label is `__meta_hetzner_robot_datacenter`.
+- For the `hcloud` role, the label will be removed after 1 July 2026. For more details, see the [changelog](https://docs.hetzner.cloud/changelog#2025-12-16-phasing-out-datacenters).
 
 The labels below are only available for targets with `role` set to `hcloud`:
 
@@ -1928,8 +2299,10 @@ The labels below are only available for targets with `role` set to `hcloud`:
 * `__meta_hetzner_hcloud_image_description`: the description of the server image
 * `__meta_hetzner_hcloud_image_os_flavor`: the OS flavor of the server image
 * `__meta_hetzner_hcloud_image_os_version`: the OS version of the server image
-* `__meta_hetzner_hcloud_datacenter_location`: the location of the server
-* `__meta_hetzner_hcloud_datacenter_location_network_zone`: the network zone of the server
+* `__meta_hetzner_hcloud_location`: the location of the server
+* `__meta_hetzner_hcloud_location_network_zone`: the network zone of the server
+* `__meta_hetzner_hcloud_datacenter_location`: the location of the server (deprecated in favor of `__meta_hetzner_hcloud_location`)
+* `__meta_hetzner_hcloud_datacenter_location_network_zone`: the network zone of the server (deprecated in favor of `__meta_hetzner_hcloud_location_network_zone`)
 * `__meta_hetzner_hcloud_server_type`: the type of the server
 * `__meta_hetzner_hcloud_cpu_cores`: the CPU cores count of the server
 * `__meta_hetzner_hcloud_cpu_type`: the CPU type of the server (shared or dedicated)
@@ -1941,6 +2314,7 @@ The labels below are only available for targets with `role` set to `hcloud`:
 
 The labels below are only available for targets with `role` set to `robot`:
 
+* `__meta_hetzner_robot_datacenter`: the datacenter of the server
 * `__meta_hetzner_robot_product`: the product of the server
 * `__meta_hetzner_robot_cancelled`: the server cancellation status
 
@@ -1995,6 +2369,10 @@ refresh failures.
 Each target has a meta label `__meta_url` during the
 [relabeling phase](#relabel_config). Its value is set to the
 URL from which the target was extracted.
+
+There is a list of
+[integrations](https://prometheus.io/docs/operating/integrations/#http-service-discovery) with this
+discovery mechanism.
 
 ```yaml
 # URL from which the targets are fetched.
@@ -2070,6 +2448,7 @@ Available meta labels:
 
 * `__meta_kubernetes_node_name`: The name of the node object.
 * `__meta_kubernetes_node_provider_id`: The cloud provider's name for the node object.
+* `__meta_kubernetes_node_condition_<condition_type>`: For every entry in node.Status.Conditions, a label with the condition type in lowercase. Possible values are `true`, `false`, or `unknown`. Examples: `__meta_kubernetes_node_condition_ready`, `__meta_kubernetes_node_condition_memorypressure`, `__meta_kubernetes_node_condition_diskpressure`.
 * `__meta_kubernetes_node_label_<labelname>`: Each label from the node object, with any unsupported characters converted to an underscore.
 * `__meta_kubernetes_node_labelpresent_<labelname>`: `true` for each label from the node object, with any unsupported characters converted to an underscore.
 * `__meta_kubernetes_node_annotation_<annotationname>`: Each annotation from the node object.
@@ -2132,6 +2511,9 @@ Available meta labels:
 * `__meta_kubernetes_pod_uid`: The UID of the pod object.
 * `__meta_kubernetes_pod_controller_kind`: Object kind of the pod controller.
 * `__meta_kubernetes_pod_controller_name`: Name of the pod controller.
+* `__meta_kubernetes_pod_deployment_name`: Name of the deployment the pod belongs to. Requires `attach_metadata: {deployment: true}`.
+* `__meta_kubernetes_pod_cronjob_name`: Name of the cronjob the pod belongs to. Requires `attach_metadata: {cronjob: true}`.
+* `__meta_kubernetes_pod_job_name`: Name of the job the pod belongs to. Requires `attach_metadata: {job: true}`.
 
 #### `endpoints`
 
@@ -2172,7 +2554,7 @@ The role requires the `discovery.k8s.io/v1` API version (available since Kuberne
 
 Available meta labels:
 
-* `__meta_kubernetes_namespace`: The namespace of the endpoints object.
+* `__meta_kubernetes_namespace`: The namespace of the endpointslice object.
 * `__meta_kubernetes_endpointslice_name`: The name of endpointslice object.
 * `__meta_kubernetes_endpointslice_label_<labelname>`: Each label from the endpointslice object, with any unsupported characters converted to an underscore.
 * `__meta_kubernetes_endpointslice_labelpresent_<labelname>`: `true` for each label from the endpointslice object, with any unsupported characters converted to an underscore.
@@ -2268,6 +2650,18 @@ attach_metadata:
 # Attaches namespace metadata to discovered targets. Valid for roles: pod, endpoints, endpointslice, service, ingress.
 # When set to true, Prometheus must have permissions to list/watch Namespaces.
   [ namespace: <boolean> | default = false ]
+# Attaches deployment metadata to discovered pod targets. Valid for role: pod.
+# When set to true, Prometheus must have permissions to list/watch ReplicaSets.
+# Enables the __meta_kubernetes_pod_deployment_name label.
+  [ deployment: <boolean> | default = false ]
+# Attaches job metadata to discovered pod targets. Valid for role: pod.
+# When set to true, Prometheus must have permissions to list/watch Jobs.
+# Enables the __meta_kubernetes_pod_job_name label.
+  [ job: <boolean> | default = false ]
+# Attaches cronjob metadata to discovered pod targets. Valid for role: pod.
+# When set to true, Prometheus must have permissions to list/watch Jobs.
+# Enables the __meta_kubernetes_pod_cronjob_name label.
+  [ cronjob: <boolean> | default = false ]
 
 # HTTP client settings, including authentication methods (such as basic auth and
 # authorization), proxy configurations, TLS options, custom HTTP headers, etc.
@@ -2360,6 +2754,9 @@ See below for the configuration options for Lightsail discovery:
 
 # AWS Role ARN, an alternative to using AWS API keys.
 [ role_arn: <string> ]
+
+# Optional External ID that can go along with role_arn.
+[ external_id: <string> ]
 
 # Refresh interval to re-read the instance list.
 [ refresh_interval: <duration> | default = 60s ]
@@ -2483,8 +2880,7 @@ in the configuration file), which can also be changed using relabeling.
 
 ### `<nerve_sd_config>`
 
-Nerve SD configurations allow retrieving scrape targets from [AirBnB's Nerve]
-(https://github.com/airbnb/nerve) which are stored in
+Nerve SD configurations allow retrieving scrape targets from [AirBnB's Nerve](https://github.com/airbnb/nerve) which are stored in
 [Zookeeper](https://zookeeper.apache.org/).
 
 The following meta labels are available on targets during [relabeling](#relabel_config):
@@ -2536,10 +2932,141 @@ The following meta labels are available on targets during [relabeling](#relabel_
 [ <http_config> ]
 ```
 
+### `<oci_sd_config>`
+
+OCI SD configurations allow retrieving scrape targets from Oracle Cloud Infrastructure (OCI)
+compute instances. The private IP of the primary VNIC is used as the default address.
+Where no private IP is present, the public IP is used instead, and where neither is
+present the first IPv6 address of the primary VNIC is used.
+
+The following OCI IAM policies are required. For API key authentication (user credentials):
+
+```text
+Allow group <group-name> to read instances in tenancy
+Allow group <group-name> to read compartments in tenancy
+Allow group <group-name> to read vnic-attachments in tenancy
+Allow group <group-name> to read vnics in tenancy
+```
+
+For instance principal authentication (Prometheus running on OCI compute):
+
+```text
+Allow dynamic-group <dynamic-group-name> to read instances in tenancy
+Allow dynamic-group <dynamic-group-name> to read compartments in tenancy
+Allow dynamic-group <dynamic-group-name> to read vnic-attachments in tenancy
+Allow dynamic-group <dynamic-group-name> to read vnics in tenancy
+```
+
+The following meta labels are available on all targets during
+[relabeling](#relabel_config):
+
+* `__meta_oci_availability_domain`: the availability domain of the instance (e.g. `US-ASHBURN-AD-1`)
+* `__meta_oci_compartment_id`: the OCID of the compartment the instance belongs to
+* `__meta_oci_defined_tag_<namespace>_<key>`: each defined tag of the instance. Scalar values (strings, numbers, booleans) are stringified; non-scalar values are dropped
+* `__meta_oci_fault_domain`: the fault domain of the instance (e.g. `FAULT-DOMAIN-1`)
+* `__meta_oci_hostname_label`: the hostname label of the primary VNIC, if assigned
+* `__meta_oci_image_id`: the OCID of the image the instance was launched from
+* `__meta_oci_instance_id`: the OCID of the instance
+* `__meta_oci_instance_name`: the display name of the instance
+* `__meta_oci_instance_shape`: the shape of the instance (e.g. `VM.Standard.E4.Flex`)
+* `__meta_oci_instance_state`: the lifecycle state of the instance (e.g. `RUNNING`, `STOPPED`, `TERMINATED`). Use relabeling to restrict scraping to states you care about.
+* `__meta_oci_ipv6_addresses`: the IPv6 addresses of the primary VNIC, comma-separated and surrounded by commas (e.g. `,2001:db8::1,2001:db8::2,`); empty when none are assigned
+* `__meta_oci_private_ip`: the private IP address of the primary VNIC
+* `__meta_oci_public_ip`: the public IP address of the primary VNIC, if assigned
+* `__meta_oci_region`: the OCI region identifier (e.g. `us-ashburn-1`)
+* `__meta_oci_tag_<key>`: each freeform tag of the instance
+* `__meta_oci_tenancy_id`: the OCID of the tenancy the instance belongs to
+* `__meta_oci_vnic_id`: the OCID of the primary VNIC
+
+In tag and namespace names, any character outside `[a-zA-Z0-9_]` is replaced
+with an underscore; case is preserved. For example, a freeform tag named
+`appOwner` is exposed as `__meta_oci_tag_appOwner`, and a defined tag in
+namespace `Operations` with key `Cost Center` is exposed as
+`__meta_oci_defined_tag_Operations_Cost_Center`. Because case is preserved,
+tag keys that differ only in case (`Env` and `env`) produce distinct labels.
+
+To restrict targets to instances carrying a specific tag, use
+[`relabel_configs`](#relabel_config) with `keep` or `drop` actions matching the
+relevant `__meta_oci_tag_*` or `__meta_oci_defined_tag_*` label.
+
+Targets with no resolvable primary-VNIC IP (neither private nor public) are
+dropped to avoid emitting unscrapeable `:<port>` addresses. The address used
+is the private IP when available, falling back to the public IP.
+
+```yaml
+# Authentication method. Supported values: "api_key" (default), "instance_principal".
+# "instance_principal" uses IMDS-based credentials and requires no credential fields;
+# it is the recommended method when Prometheus runs on OCI compute.
+[ auth: <string> | default = "api_key" ]
+
+# API key auth fields. Required when auth is "api_key".
+[ tenancy: <string> ]
+[ user: <string> ]
+[ fingerprint: <string> ]
+[ key_file: <string> ]
+# Passphrase for the private key. Mutually exclusive with key_passphrase_file.
+[ key_passphrase: <secret> ]
+# Path to a file containing the passphrase for the private key. Mutually
+# exclusive with key_passphrase. The file is read at configuration load
+# time; rotating the file requires reloading Prometheus.
+[ key_passphrase_file: <string> ]
+
+# OCI region identifier. Required.
+region: <string>
+
+# Explicit list of compartment OCIDs to scan. When empty, all active
+# compartments reachable from the tenancy root are discovered automatically
+# via the OCI Identity API using a breadth-first walk. Compartments that
+# cannot be listed due to missing permissions are skipped with a warning so
+# that a single permission gap does not abort the walk.
+[ compartments:
+  [ - <string> ... ] ]
+
+# Authentication information used to authenticate to the API server.
+# Note that `basic_auth`, `authorization`, and `oauth2` options are
+# mutually exclusive. `password` and `password_file` are mutually exclusive.
+# It is mostly useful to configure `proxy_url`, `tls_config`, and the
+# underlying HTTP transport when targeting OCI through a corporate proxy
+# or with a custom CA bundle.
+# Optional HTTP basic authentication information, currently not supported by OCI.
+[ basic_auth: <basic_auth> ]
+# Optional `Authorization` header configuration, currently not supported by OCI.
+[ authorization: <authorization> ]
+# Optional OAuth 2.0 configuration, currently not supported by OCI.
+[ oauth2: <oauth2> ]
+
+# Optional proxy URL.
+[ proxy_url: <string> ]
+# Comma-separated string that can contain IPs, CIDR notation, domain names
+# that should be excluded from proxying. IP and domain names can
+# contain port numbers.
+[ no_proxy: <string> ]
+# Use proxy URL indicated by environment variables (HTTP_PROXY, HTTPS_PROXY, NO_PROXY, and their lowercase versions)
+[ proxy_from_environment: <boolean> | default: false ]
+# Specifies headers to send to proxies during CONNECT requests.
+[ proxy_connect_header:
+  [ <string>: [<secret>, ...] ] ]
+
+# Configure whether HTTP requests follow HTTP 3xx redirects.
+[ follow_redirects: <boolean> | default = true ]
+
+# Whether to enable HTTP2.
+[ enable_http2: <boolean> | default: true ]
+
+# Configures the TLS settings.
+tls_config:
+  [ <tls_config> ]
+
+# The port to scrape metrics from.
+[ port: <int> | default = 80 ]
+
+# The time after which the instances are refreshed.
+[ refresh_interval: <duration> | default = 60s ]
+```
+
 ### `<serverset_sd_config>`
 
-Serverset SD configurations allow retrieving scrape targets from [Serversets]
-(https://github.com/twitter/finagle/tree/develop/finagle-serversets) which are
+Serverset SD configurations allow retrieving scrape targets from [Serversets](https://github.com/twitter/finagle/tree/develop/finagle-serversets) which are
 stored in [Zookeeper](https://zookeeper.apache.org/). Serversets are commonly
 used by [Finagle](https://twitter.github.io/finagle/) and
 [Aurora](https://aurora.apache.org/).
@@ -2956,6 +3483,49 @@ The following meta labels are available on targets during [relabeling](#relabel_
 [ <http_config> ]
 ```
 
+### `<outscale_sd_config>`
+
+Outscale SD configurations allow retrieving scrape targets from [Outscale Cloud](https://outscale.com/) VMs via the Outscale API (OAPI).
+
+The following meta labels are available on targets during [relabeling](#relabel_config):
+
+* `__meta_outscale_vm_instance_id`: the ID of the VM
+* `__meta_outscale_vm_region`: the region of the VM
+* `__meta_outscale_vm_subregion`: the subregion of the VM
+* `__meta_outscale_vm_state`: the state of the VM
+* `__meta_outscale_vm_private_ip`: the private IP address of the VM
+* `__meta_outscale_vm_public_ip`: the public IP address of the VM
+* `__meta_outscale_vm_tag_<key>`: each tag value; the tag key is sanitized and appended (e.g. tag key `Name` → `__meta_outscale_vm_tag_Name`)
+
+Targets use the first address found: private IP, then public IP. This can be changed with relabeling, as demonstrated in [the Prometheus outscale-sd configuration file](/documentation/examples/prometheus-outscale.yml).
+
+See below for the configuration options for Outscale discovery:
+
+```yaml
+# Region to use.
+[ region: <string> | default = "eu-west-2" ]
+
+# Access key (20 alphanumeric characters). See https://docs.outscale.com/en/userguide/Creating-an-Access-Key.html
+access_key: <string>
+
+# Secret key (40 characters). Use one of `secret_key` or `secret_key_file`.
+[ secret_key: <secret> ]
+
+# Secret key file.
+[ secret_key_file: <filename> ]
+
+# API endpoint URL. Defaults to https://api.<region>.outscale.com/api/v1 if empty.
+[ endpoint: <string> ]
+
+# The port to scrape metrics from.
+[ port: <int> | default = 80 ]
+
+# Refresh interval to re-read the targets list.
+[ refresh_interval: <duration> | default = 60s ]
+
+# HTTP client settings.
+[ <http_config> ]
+```
 
 ### `<static_config>`
 
@@ -2973,6 +3543,11 @@ labels:
   [ <labelname>: <labelvalue> ... ]
 ```
 
+The special labels mentioned in the [relabeling](#relabel_config) section can also be
+used here to override the respective settings in the scrape configuration. This is
+especially useful when combined with any of the service discovery mechanisms that do not
+support these settings directly.
+
 ### `<relabel_config>`
 
 Relabeling is a powerful tool to dynamically rewrite the label set of a target before
@@ -2982,6 +3557,13 @@ in the configuration file.
 
 Initially, aside from the configured per-target labels, a target's `job`
 label is set to the `job_name` value of the respective scrape configuration.
+
+You can also use special labels like `__address__`, `__scheme__`, `__metrics_path__`,
+`__scrape_interval__`, `__scrape_timeout__`, `__convert_classic_histograms_to_nhcb__`,
+`__always_scrape_classic_histograms__`, `__scrape_native_histograms__`
+to customize the defined targets. These will
+override the respective settings in the scrape configuration.
+
 The `__address__` label is set to the `<host>:<port>` address of the target.
 After relabeling, the `instance` label is set to the value of `__address__` by default if
 it was not set during relabeling.
@@ -2994,6 +3576,26 @@ label is set to the value of the first passed URL parameter called `<name>`, as 
 
 The `__scrape_interval__` and `__scrape_timeout__` labels are set to the target's
 interval and timeout, as specified in `scrape_config`.
+
+The `__convert_classic_histograms_to_nhcb__` label is set to the target's
+`convert_classic_histograms_to_nhcb` value, as specified in `scrape_config`
+(defaulting to the configured global). Setting it during relabeling overrides,
+per target, whether classic histograms are converted to native histograms with
+custom buckets. Its value must parse as a boolean; a target with an invalid
+value is dropped.
+
+The `__always_scrape_classic_histograms__` label is set to the target's
+`always_scrape_classic_histograms` value, as specified in `scrape_config`
+(defaulting to the configured global). Setting it during relabeling overrides,
+per target, whether a classic histogram is also ingested when it is exposed as
+a native histogram. Its value must parse as a boolean; a target with an invalid
+value is dropped.
+
+The `__scrape_native_histograms__` label is set to the target's
+`scrape_native_histograms` value, as specified in `scrape_config` (defaulting to
+the configured global). Setting it during relabeling overrides, per target,
+whether native histograms are scraped. Its value must parse as a boolean; a
+target with an invalid value is dropped.
 
 Additional labels prefixed with `__meta_` may be available during the
 relabeling phase. They are set by the service discovery mechanism that provided
@@ -3125,6 +3727,10 @@ sigv4:
   # AWS Role ARN, an alternative to using AWS API keys.
   [ role_arn: <string> ]
 
+  # AWS External ID used when assuming a role.
+  # Can only be used with role_arn.
+  [ external_id: <string> ]
+
   # Defines the FIPS mode for the AWS STS endpoint.
   # Requires Prometheus >= 2.54.0
   # Note: FIPS STS selection should be configured via use_fips_sts_endpoint rather than environment variables. (The problem report that motivated this: AWS_USE_FIPS_ENDPOINT no longer works.)
@@ -3214,9 +3820,17 @@ nerve_sd_configs:
 nomad_sd_configs:
   [ - <nomad_sd_config> ... ]
 
+# List of OCI service discovery configurations.
+oci_sd_configs:
+  [ - <oci_sd_config> ... ]
+
 # List of OpenStack service discovery configurations.
 openstack_sd_configs:
   [ - <openstack_sd_config> ... ]
+
+# List of Outscale service discovery configurations.
+outscale_sd_configs:
+  [ - <outscale_sd_config> ... ]
 
 # List of OVHcloud service discovery configurations.
 ovhcloud_sd_configs:
@@ -3281,7 +3895,7 @@ url: <string>
 # * The `prometheus.WriteRequest` represents the message introduced in Remote Write 1.0, which
 # will be deprecated eventually.
 # * The `io.prometheus.write.v2.Request` was introduced in Remote Write 2.0 and replaces the former,
-# by improving efficiency and sending metadata, created timestamp and native histograms by default.
+# by improving efficiency and sending metadata, start timestamp and native histograms by default.
 #
 # Before changing this value, consult with your remote storage provider (or test) what message it supports.
 # Read more on https://prometheus.io/docs/specs/remote_write_spec_2_0/#io-prometheus-write-v2-request
@@ -3336,6 +3950,10 @@ sigv4:
   # AWS Role ARN, an alternative to using AWS API keys.
   [ role_arn: <string> ]
 
+  # AWS External ID used when assuming a role.
+  # Can only be used with role_arn.
+  [ external_id: <string> ]
+
   # Defines the FIPS mode for the AWS STS endpoint.
   # Requires Prometheus >= 2.54.0
   # Note: FIPS STS selection should be configured via use_fips_sts_endpoint rather than environment variables. (The problem report that motivated this: AWS_USE_FIPS_ENDPOINT no longer works.)
@@ -3362,6 +3980,18 @@ azuread:
       [ client_id: <string> ]
       [ client_secret: <string> ]
       [ tenant_id: <string> ] ]
+
+  # Azure Certificate-based authentication.
+  [ certificate:
+      client_id: <string>
+      tenant_id: <string>
+      certificate_path: <file_name>
+      # Optional path to private key file if separate from certificate
+      [ certificate_key_path: <file_name> ]
+      # Optional password for password-protected certificate files (PFX/PKCS12)
+      [ certificate_password: <secret> ]
+      # Whether to send the certificate chain in the x5c header
+      [ send_certificate_chain: <boolean> | default = false ] ]
 
   # Azure SDK auth.
   # See https://learn.microsoft.com/en-us/azure/developer/go/azure-sdk-authentication
@@ -3424,7 +4054,7 @@ metadata_config:
   # How frequently metric metadata is sent to remote storage.
   [ send_interval: <duration> | default = 1m ]
   # Maximum number of samples per send.
-  [ max_samples_per_send: <int> | default = 500]
+  [ max_samples_per_send: <int> | default = 2000]
 
 # HTTP client settings, including authentication methods (such as basic auth and
 # authorization), proxy configurations, TLS options, custom HTTP headers, etc.
@@ -3509,6 +4139,25 @@ with this feature.
 # This is an experimental feature, this behaviour could change or be removed in the future.
 [ stale_series_compaction_threshold: <float> | default = 0 ]
 
+# Configures the float chunk encoding to use for new chunks.
+# Valid values are 'xor' and 'xor2'. When absent, the encoding follows the
+# --enable-feature=xor2-encoding flag: 'xor2' if the flag is set, 'xor' otherwise.
+# Setting 'xor' forces standard XOR encoding even when --enable-feature=xor2-encoding is set.
+# Setting 'xor2' is only valid when --enable-feature=xor2-encoding is set;
+# Prometheus will refuse to reload if 'xor2' is set without the feature flag.
+# Setting 'xor' is incompatible with --enable-feature=st-storage (XOR chunks do not store
+# start timestamps); Prometheus will refuse to reload in that case too.
+# Omitting 'floats' (or the entire 'chunk_encoding' field) is equivalent; the encoding
+# follows the --enable-feature=xor2-encoding flag.
+# This field is runtime-reloadable.
+# When --enable-feature=st-storage is disabled, XOR and XOR2 are compatible
+# encodings and in-progress chunks are not cut on an encoding change; the new
+# encoding takes effect when the current chunk is next cut for any reason (size, time range, or sample count).
+# When --enable-feature=st-storage is enabled, XOR and XOR2 are not compatible
+# (XOR chunks do not store start timestamps), so an in-progress chunk is cut
+# on the next append after the encoding changes.
+[ chunk_encoding:
+  [ floats: <string> ] ]
 
 # Configures data retention settings for TSDB.
 #
@@ -3518,9 +4167,9 @@ with this feature.
 # or when a compaction completes, whichever comes first.
 [ retention: <retention> ] :
   # How long to retain samples in storage. If neither this option nor the size option
-  # is set, the retention time defaults to 15d. Units Supported: y, w, d, h, m, s, ms.
+  # is set, the retention time defaults to 15d. Setting this to 0 disables time-based retention.
   # This option takes precedence over the deprecated command-line flag --storage.tsdb.retention.time.
-  [ time: <duration> | default = 15d ]
+  [ time: <duration> ]
 
   # Maximum number of bytes that can be stored for blocks. A unit is required,
   # supported units: B, KB, MB, GB, TB, PB, EB. Ex: "512MB". Based on powers-of-2, so 1KB is 1024B.
@@ -3528,6 +4177,14 @@ with this feature.
   # This option takes precedence over the deprecated command-line flag --storage.tsdb.retention.size.
   [ size: <size> | default = 0 ]
 
+  # Maximum percent of total disk space allowed for storage of blocks. Alternative to `size` and
+  # behaves the same as if size was calculated by hand as a percentage of the total storage capacity.
+  # Prometheus will fail to start if this config is enabled, but it fails to query the total storage capacity.
+  # The total disk space allowed will automatically adapt to volume resize.
+  # If set to 0 or not set, percentage-based retention is disabled.
+  #
+  # This is an experimental feature, this behaviour could change or be removed in the future.
+  [ percentage: <uint> | default = 0 ]
 ```
 
 ### `<exemplars>`
@@ -3570,3 +4227,6 @@ headers:
 tls_config:
   [ <tls_config> ]
 ```
+
+If query logging and tracing are both enabled, a traceID and spanID will be injected
+into the query log file for use in log/trace correlation.

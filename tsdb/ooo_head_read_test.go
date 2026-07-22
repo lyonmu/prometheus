@@ -17,6 +17,8 @@ import (
 	"context"
 	"fmt"
 	"math"
+	"os"
+	"runtime"
 	"slices"
 	"sort"
 	"testing"
@@ -28,6 +30,7 @@ import (
 	"github.com/prometheus/prometheus/storage"
 	"github.com/prometheus/prometheus/tsdb/chunkenc"
 	"github.com/prometheus/prometheus/tsdb/chunks"
+	"github.com/prometheus/prometheus/util/annotations"
 	"github.com/prometheus/prometheus/util/compression"
 )
 
@@ -1113,4 +1116,154 @@ func TestSortMetaByMinTimeAndMinRef(t *testing.T) {
 			require.Equal(t, tc.expMetas, tc.inputMetas)
 		})
 	}
+}
+
+// mockSearchQuerier is a minimal storage.Querier that also implements storage.Searcher.
+type mockSearchQuerier struct {
+	labelNames  []string
+	labelValues []string
+}
+
+func (*mockSearchQuerier) Select(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+	return storage.EmptySeriesSet()
+}
+
+func (m *mockSearchQuerier) LabelValues(_ context.Context, _ string, _ *storage.LabelHints, _ ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return m.labelValues, nil, nil
+}
+
+func (m *mockSearchQuerier) LabelNames(_ context.Context, _ *storage.LabelHints, _ ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return m.labelNames, nil, nil
+}
+
+func (*mockSearchQuerier) Close() error { return nil }
+
+func (m *mockSearchQuerier) SearchLabelNames(_ context.Context, _ *storage.SearchHints, _ ...*labels.Matcher) storage.SearchResultSet {
+	results := make([]storage.SearchResult, len(m.labelNames))
+	for i, n := range m.labelNames {
+		results[i] = storage.SearchResult{Value: n, Score: 1.0}
+	}
+	return storage.NewSearchResultSetFromSlice(results, nil)
+}
+
+func (m *mockSearchQuerier) SearchLabelValues(_ context.Context, _ string, _ *storage.SearchHints, _ ...*labels.Matcher) storage.SearchResultSet {
+	results := make([]storage.SearchResult, len(m.labelValues))
+	for i, v := range m.labelValues {
+		results[i] = storage.SearchResult{Value: v, Score: 1.0}
+	}
+	return storage.NewSearchResultSetFromSlice(results, nil)
+}
+
+// mockSearchQuerierNoSearch is a storage.Querier that does not implement storage.Searcher.
+type mockSearchQuerierNoSearch struct{}
+
+func (mockSearchQuerierNoSearch) Select(context.Context, bool, *storage.SelectHints, ...*labels.Matcher) storage.SeriesSet {
+	return storage.EmptySeriesSet()
+}
+
+func (mockSearchQuerierNoSearch) LabelValues(context.Context, string, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (mockSearchQuerierNoSearch) LabelNames(context.Context, *storage.LabelHints, ...*labels.Matcher) ([]string, annotations.Annotations, error) {
+	return nil, nil, nil
+}
+
+func (mockSearchQuerierNoSearch) Close() error { return nil }
+
+func TestHeadAndOOOQuerierSearch(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("nil inner querier returns empty", func(t *testing.T) {
+		q := &HeadAndOOOQuerier{}
+		rs := q.SearchLabelNames(ctx, nil)
+		require.False(t, rs.Next())
+		require.NoError(t, rs.Err())
+		require.NoError(t, rs.Close())
+
+		rs = q.SearchLabelValues(ctx, "env", nil)
+		require.False(t, rs.Next())
+		require.NoError(t, rs.Err())
+		require.NoError(t, rs.Close())
+	})
+
+	t.Run("delegates to inner searcher", func(t *testing.T) {
+		inner := &mockSearchQuerier{
+			labelNames:  []string{"env", "job"},
+			labelValues: []string{"prod", "dev"},
+		}
+		q := &HeadAndOOOQuerier{querier: inner}
+
+		rs := q.SearchLabelNames(ctx, nil)
+		var names []string
+		for rs.Next() {
+			names = append(names, rs.At().Value)
+		}
+		require.NoError(t, rs.Err())
+		require.NoError(t, rs.Close())
+		require.Equal(t, []string{"env", "job"}, names)
+
+		rs = q.SearchLabelValues(ctx, "env", nil)
+		var values []string
+		for rs.Next() {
+			values = append(values, rs.At().Value)
+		}
+		require.NoError(t, rs.Err())
+		require.NoError(t, rs.Close())
+		require.Equal(t, []string{"prod", "dev"}, values)
+	})
+
+	t.Run("non-searcher inner querier returns empty", func(t *testing.T) {
+		inner := mockSearchQuerierNoSearch{}
+		q := &HeadAndOOOQuerier{querier: inner}
+
+		rs := q.SearchLabelNames(ctx, nil)
+		require.False(t, rs.Next())
+		require.NoError(t, rs.Close())
+
+		rs = q.SearchLabelValues(ctx, "env", nil)
+		require.False(t, rs.Next())
+		require.NoError(t, rs.Close())
+	})
+}
+
+// TestNewOOOCompactionHead_panicReleasesLock is a regression test for
+// https://github.com/prometheus/prometheus/issues/17941: if mmapCurrentOOOHeadChunk
+// panics (via handleChunkWriteError) while NewOOOCompactionHead holds the series
+// lock, that lock must still be released so head shutdown does not deadlock.
+func TestNewOOOCompactionHead_panicReleasesLock(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("forces a chunk-write failure by removing the open chunk directory, which Windows disallows while the ChunkDiskMapper holds the directory handle")
+	}
+
+	h, _ := newTestHead(t, DefaultBlockDuration, compression.None, true /* oooEnabled */)
+	require.NoError(t, h.Init(0))
+
+	lbls := labels.FromStrings("__name__", "series")
+	app := h.Appender(t.Context())
+	inOrderTs := 60 * time.Minute.Milliseconds()
+	_, err := app.Append(0, lbls, inOrderTs, 0)
+	require.NoError(t, err)
+	// An out-of-order sample within the OOO window creates an OOO head chunk.
+	_, err = app.Append(0, lbls, inOrderTs-5*time.Minute.Milliseconds(), 1)
+	require.NoError(t, err)
+	require.NoError(t, app.Commit())
+
+	s := h.series.getByHash(lbls.Hash(), lbls)
+	require.NotNil(t, s)
+	require.NotNil(t, s.ooo, "expected an OOO head chunk")
+
+	// Removing the chunk directory makes mmapCurrentOOOHeadChunk's segment cut
+	// fail, so handleChunkWriteError panics while the series lock is held.
+	require.NoError(t, os.RemoveAll(mmappedChunksDir(h.opts.ChunkDirRoot)))
+	// newTestHead's cleanup calls Head.Close() -> mmapHeadChunks(); closing the
+	// mapper first makes WriteChunk return ErrChunkDiskMapperClosed (which
+	// handleChunkWriteError does not panic on), so shutdown stays clean. Cleanups
+	// run LIFO, so this runs before Head.Close().
+	t.Cleanup(func() { _ = h.chunkDiskMapper.Close() })
+
+	require.Panics(t, func() { _, _ = NewOOOCompactionHead(t.Context(), h) })
+
+	require.True(t, s.TryLock(), "series lock leaked after panic")
+	s.Unlock()
 }

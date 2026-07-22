@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"log/slog"
 	"math"
 	"os"
@@ -31,6 +32,7 @@ import (
 	"github.com/prometheus/prometheus/tsdb/fileutil"
 	"github.com/prometheus/prometheus/tsdb/record"
 	"github.com/prometheus/prometheus/tsdb/tombstones"
+	"github.com/prometheus/prometheus/tsdb/tsdbutil"
 )
 
 // CheckpointStats returns stats about a created checkpoint.
@@ -80,19 +82,34 @@ func DeleteCheckpoints(dir string, maxIndex int) error {
 	return errors.Join(errs...)
 }
 
-// CheckpointPrefix is the prefix used for checkpoint files.
-const CheckpointPrefix = "checkpoint."
+// CheckpointTempFileSuffix is the suffix used when creating temporary checkpoint files.
+const CheckpointTempFileSuffix = ".tmp"
+
+// DeleteTempCheckpoints deletes all temporary checkpoint directories in the given directory.
+func DeleteTempCheckpoints(logger *slog.Logger, dir string) error {
+	if err := tsdbutil.RemoveTmpDirs(logger, dir, isTempDir); err != nil {
+		return fmt.Errorf("remove previous temporary checkpoint dirs: %w", err)
+	}
+	return nil
+}
 
 // Checkpoint creates a compacted checkpoint of segments in range [from, to] in the given WAL.
 // It includes the most recent checkpoint if it exists.
-// All series not satisfying keep, samples/tombstones/exemplars below mint and
-// metadata that are not the latest are dropped.
+// All series not satisfying keep, samples/exemplars below mint, tombstones not
+// satisfying keep or with all intervals below mint, and metadata that are not the
+// latest are dropped.
+//
+// keep is evaluated per record as segments are read, so its result for a given ref
+// must not change while Checkpoint runs. Otherwise records for the same ref could be
+// treated inconsistently, e.g. a series record kept but its tombstone dropped. The
+// Head satisfies this by serializing checkpointing with every series-deleting path
+// (GC and series truncation) via chunkSnapshotMtx.
 //
 // The checkpoint is stored in a directory named checkpoint.N in the same
 // segmented format as the original WAL itself.
 // This makes it easy to read it through the WAL package and concatenate
 // it with the original WAL.
-func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.HeadSeriesRef) bool, mint int64) (*CheckpointStats, error) {
+func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.HeadSeriesRef) bool, mint int64, enableSTStorage bool) (*CheckpointStats, error) {
 	stats := &CheckpointStats{}
 	var sgmReader io.ReadCloser
 
@@ -123,12 +140,12 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 		defer sgmReader.Close()
 	}
 
-	cpdir := checkpointDir(w.Dir(), to)
-	cpdirtmp := cpdir + ".tmp"
-
-	if err := os.RemoveAll(cpdirtmp); err != nil {
-		return nil, fmt.Errorf("remove previous temporary checkpoint dir: %w", err)
+	if err := DeleteTempCheckpoints(logger, w.Dir()); err != nil {
+		return nil, err
 	}
+
+	cpdir := CheckpointDir(w.Dir(), to)
+	cpdirtmp := cpdir + CheckpointTempFileSuffix
 
 	if err := os.MkdirAll(cpdirtmp, 0o777); err != nil {
 		return nil, fmt.Errorf("create checkpoint dir: %w", err)
@@ -156,7 +173,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 		metadata              []record.RefMetadata
 		st                    = labels.NewSymbolTable() // Needed for decoding; labels do not outlive this function.
 		dec                   = record.NewDecoder(st, logger)
-		enc                   record.Encoder
+		enc                   = record.Encoder{EnableSTStorage: enableSTStorage}
 		buf                   []byte
 		recs                  [][]byte
 
@@ -190,7 +207,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 			stats.TotalSeries += len(series)
 			stats.DroppedSeries += len(series) - len(repl)
 
-		case record.Samples:
+		case record.Samples, record.SamplesV2:
 			samples, err = dec.Samples(rec, samples)
 			if err != nil {
 				return nil, fmt.Errorf("decode samples: %w", err)
@@ -208,7 +225,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 			stats.TotalSamples += len(samples)
 			stats.DroppedSamples += len(samples) - len(repl)
 
-		case record.HistogramSamples:
+		case record.HistogramSamples, record.HistogramSamplesV2:
 			histogramSamples, err = dec.HistogramSamples(rec, histogramSamples)
 			if err != nil {
 				return nil, fmt.Errorf("decode histogram samples: %w", err)
@@ -221,7 +238,18 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 				}
 			}
 			if len(repl) > 0 {
-				buf, _ = enc.HistogramSamples(repl, buf)
+				var leftover []record.RefHistogramSample
+				buf, leftover = enc.HistogramSamples(repl, buf)
+				if len(leftover) > 0 {
+					// Flush the exponential-histogram record before
+					// appending the custom-bucket record so they are
+					// written as two separate WAL records.
+					if expEnd := len(buf); expEnd > start {
+						recs = append(recs, buf[start:expEnd])
+						start = expEnd
+					}
+					buf = enc.CustomBucketsHistogramSamples(leftover, buf)
+				}
 			}
 			stats.TotalSamples += len(histogramSamples)
 			stats.DroppedSamples += len(histogramSamples) - len(repl)
@@ -242,7 +270,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 			}
 			stats.TotalSamples += len(histogramSamples)
 			stats.DroppedSamples += len(histogramSamples) - len(repl)
-		case record.FloatHistogramSamples:
+		case record.FloatHistogramSamples, record.FloatHistogramSamplesV2:
 			floatHistogramSamples, err = dec.FloatHistogramSamples(rec, floatHistogramSamples)
 			if err != nil {
 				return nil, fmt.Errorf("decode float histogram samples: %w", err)
@@ -255,7 +283,18 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 				}
 			}
 			if len(repl) > 0 {
-				buf, _ = enc.FloatHistogramSamples(repl, buf)
+				var floatLeftover []record.RefFloatHistogramSample
+				buf, floatLeftover = enc.FloatHistogramSamples(repl, buf)
+				if len(floatLeftover) > 0 {
+					// Flush the exponential-float-histogram record before
+					// appending the custom-bucket record so they are
+					// written as two separate WAL records.
+					if expEnd := len(buf); expEnd > start {
+						recs = append(recs, buf[start:expEnd])
+						start = expEnd
+					}
+					buf = enc.CustomBucketsFloatHistogramSamples(floatLeftover, buf)
+				}
 			}
 			stats.TotalSamples += len(floatHistogramSamples)
 			stats.DroppedSamples += len(floatHistogramSamples) - len(repl)
@@ -281,9 +320,13 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 			if err != nil {
 				return nil, fmt.Errorf("decode deletes: %w", err)
 			}
-			// Drop irrelevant tombstones in place.
+			// Drop irrelevant tombstones in place. A tombstone is dropped together with
+			// its series record, or once all its intervals age out of the WAL.
 			repl := tstones[:0]
 			for _, s := range tstones {
+				if !keep(chunks.HeadSeriesRef(s.Ref)) {
+					continue
+				}
 				for _, iv := range s.Intervals {
 					if iv.Maxt >= mint {
 						repl = append(repl, s)
@@ -315,7 +358,7 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 			stats.TotalExemplars += len(exemplars)
 			stats.DroppedExemplars += len(exemplars) - len(repl)
 		case record.Metadata:
-			metadata, err := dec.Metadata(rec, metadata)
+			metadata, err = dec.Metadata(rec, metadata)
 			if err != nil {
 				return nil, fmt.Errorf("decode metadata: %w", err)
 			}
@@ -394,8 +437,11 @@ func Checkpoint(logger *slog.Logger, w *WL, from, to int, keep func(id chunks.He
 	return stats, nil
 }
 
-func checkpointDir(dir string, i int) string {
-	return filepath.Join(dir, fmt.Sprintf(CheckpointPrefix+"%08d", i))
+// checkpointPrefix is the prefix used for checkpoint files.
+const checkpointPrefix = "checkpoint."
+
+func CheckpointDir(dir string, i int) string {
+	return filepath.Join(dir, fmt.Sprintf(checkpointPrefix+"%08d", i))
 }
 
 type checkpointRef struct {
@@ -411,13 +457,13 @@ func listCheckpoints(dir string) (refs []checkpointRef, err error) {
 
 	for i := range files {
 		fi := files[i]
-		if !strings.HasPrefix(fi.Name(), CheckpointPrefix) {
+		if !strings.HasPrefix(fi.Name(), checkpointPrefix) {
 			continue
 		}
 		if !fi.IsDir() {
 			return nil, fmt.Errorf("checkpoint %s is not a directory", fi.Name())
 		}
-		idx, err := strconv.Atoi(fi.Name()[len(CheckpointPrefix):])
+		idx, err := strconv.Atoi(fi.Name()[len(checkpointPrefix):])
 		if err != nil {
 			continue
 		}
@@ -430,4 +476,8 @@ func listCheckpoints(dir string) (refs []checkpointRef, err error) {
 	})
 
 	return refs, nil
+}
+
+func isTempDir(fi fs.DirEntry) bool {
+	return strings.HasPrefix(fi.Name(), checkpointPrefix) && strings.HasSuffix(fi.Name(), CheckpointTempFileSuffix)
 }

@@ -36,6 +36,7 @@ import (
 	"time"
 
 	"github.com/alecthomas/units"
+	"github.com/felixge/fgprof"
 	"github.com/grafana/regexp"
 	"github.com/mwitkow/go-conntrack"
 	remoteapi "github.com/prometheus/client_golang/exp/api/remote"
@@ -53,6 +54,7 @@ import (
 	"github.com/prometheus/prometheus/config"
 	"github.com/prometheus/prometheus/notifier"
 	"github.com/prometheus/prometheus/promql"
+	"github.com/prometheus/prometheus/promql/parser"
 	"github.com/prometheus/prometheus/rules"
 	"github.com/prometheus/prometheus/scrape"
 	"github.com/prometheus/prometheus/storage"
@@ -110,6 +112,11 @@ const (
 	NotReady ReadyStatus = iota
 	Ready
 	Stopping
+)
+
+var (
+	fgprofHandler = fgprof.Handler()
+	fgprofMu      sync.Mutex
 )
 
 // withStackTracer logs the stack trace in case the request panics. The function
@@ -249,6 +256,11 @@ func (h *Handler) ApplyConfig(conf *config.Config) error {
 	defer h.mtx.Unlock()
 
 	h.config = conf
+	if conf.StorageConfig.TSDBConfig != nil && conf.StorageConfig.TSDBConfig.Retention != nil {
+		h.options.TSDBRetentionDuration = conf.StorageConfig.TSDBConfig.Retention.Time
+		h.options.TSDBMaxBytes = conf.StorageConfig.TSDBConfig.Retention.Size
+		h.options.TSDBMaxPercentage = conf.StorageConfig.TSDBConfig.Retention.Percentage
+	}
 
 	return nil
 }
@@ -259,6 +271,7 @@ type Options struct {
 	TSDBRetentionDuration model.Duration
 	TSDBDir               string
 	TSDBMaxBytes          units.Base2Bytes
+	TSDBMaxPercentage     float64
 	LocalStorage          LocalStorage
 	Storage               storage.Storage
 	ExemplarStorage       storage.ExemplarQueryable
@@ -285,6 +298,8 @@ type Options struct {
 	UseOldUI                   bool
 	EnableLifecycle            bool
 	EnableAdminAPI             bool
+	EnableSearch               bool
+	MaxSearchLimit             int
 	PageTitle                  string
 	RemoteReadSampleLimit      int
 	RemoteReadConcurrencyLimit int
@@ -304,12 +319,18 @@ type Options struct {
 	Gatherer        prometheus.Gatherer
 	Registerer      prometheus.Registerer
 	FeatureRegistry features.Collector
+
+	// Parser is the PromQL parser used for parsing query expressions.
+	Parser parser.Parser
 }
 
 // New initializes a new web Handler.
 func New(logger *slog.Logger, o *Options) *Handler {
 	if logger == nil {
 		logger = promslog.NewNopLogger()
+	}
+	if o.Parser == nil {
+		o.Parser = parser.NewParser(parser.Options{})
 	}
 
 	m := newMetrics(o.Registerer)
@@ -356,9 +377,12 @@ func New(logger *slog.Logger, o *Options) *Handler {
 	factoryAr := func(context.Context) api_v1.AlertmanagerRetriever { return h.notifier }
 	FactoryRr := func(context.Context) api_v1.RulesRetriever { return h.ruleManager }
 
-	var app storage.Appendable
+	var (
+		app   storage.Appendable
+		appV2 storage.AppendableV2
+	)
 	if o.EnableRemoteWriteReceiver || o.EnableOTLPWriteReceiver {
-		app = h.storage
+		app, appV2 = h.storage, h.storage
 	}
 
 	version := ""
@@ -366,7 +390,7 @@ func New(logger *slog.Logger, o *Options) *Handler {
 		version = o.Version.Version
 	}
 
-	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, app, h.exemplarStorage, factorySPr, factoryTr, factoryAr,
+	h.apiV1 = api_v1.NewAPI(h.queryEngine, h.storage, app, appV2, h.exemplarStorage, factorySPr, factoryTr, factoryAr,
 		func() config.Config {
 			h.mtx.RLock()
 			defer h.mtx.RUnlock()
@@ -382,6 +406,8 @@ func New(logger *slog.Logger, o *Options) *Handler {
 		h.options.LocalStorage,
 		h.options.TSDBDir,
 		h.options.EnableAdminAPI,
+		h.options.EnableSearch,
+		h.options.MaxSearchLimit,
 		logger,
 		FactoryRr,
 		h.options.RemoteReadSampleLimit,
@@ -408,9 +434,11 @@ func New(logger *slog.Logger, o *Options) *Handler {
 		nil,
 		o.FeatureRegistry,
 		api_v1.OpenAPIOptions{
-			ExternalURL: o.ExternalURL.String(),
-			Version:     version,
+			ExternalURL:    o.ExternalURL.String(),
+			Version:        version,
+			MaxSearchLimit: o.MaxSearchLimit,
 		},
+		o.Parser,
 	)
 
 	if r := o.FeatureRegistry; r != nil {
@@ -419,6 +447,10 @@ func New(logger *slog.Logger, o *Options) *Handler {
 		r.Set(features.API, "admin", o.EnableAdminAPI)
 		r.Set(features.API, "remote_write_receiver", o.EnableRemoteWriteReceiver)
 		r.Set(features.API, "otlp_write_receiver", o.EnableOTLPWriteReceiver)
+		r.Set(features.API, "search", o.EnableSearch)
+		for _, alg := range api_v1.FuzzAlgorithms() {
+			r.Enable(features.API, "search_fuzz_alg_"+alg)
+		}
 		r.Set(features.OTLPReceiver, "delta_conversion", o.ConvertOTLPDelta)
 		r.Set(features.OTLPReceiver, "native_delta_ingestion", o.NativeOTLPDeltaIngestion)
 		r.Enable(features.API, "label_values_match") // match[] parameter for label values endpoint.
@@ -615,6 +647,13 @@ func serveDebug(w http.ResponseWriter, req *http.Request) {
 		pprof.Symbol(w, req)
 	case "trace":
 		pprof.Trace(w, req)
+	case "fgprof":
+		if !fgprofMu.TryLock() {
+			http.Error(w, "Could not enable fgprof profiling: fgprof profiling already in use", http.StatusInternalServerError)
+			return
+		}
+		defer fgprofMu.Unlock()
+		fgprofHandler.ServeHTTP(w, req)
 	default:
 		req.URL.Path = "/debug/pprof/" + subpath
 		pprof.Index(w, req)
@@ -647,14 +686,14 @@ func (h *Handler) testReady(f http.HandlerFunc) http.HandlerFunc {
 		case NotReady:
 			w.Header().Set("X-Prometheus-Stopping", "false")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, "Service Unavailable")
+			fmt.Fprint(w, "Service Unavailable")
 		case Stopping:
 			w.Header().Set("X-Prometheus-Stopping", "true")
 			w.WriteHeader(http.StatusServiceUnavailable)
-			fmt.Fprintf(w, "Service Unavailable")
+			fmt.Fprint(w, "Service Unavailable")
 		default:
 			w.WriteHeader(http.StatusInternalServerError)
-			fmt.Fprintf(w, "Unknown state")
+			fmt.Fprint(w, "Unknown state")
 		}
 	}
 }
@@ -849,14 +888,25 @@ func (h *Handler) runtimeInfo() (api_v1.RuntimeInfo, error) {
 	status.Hostname = hostname
 	status.ServerTime = time.Now().UTC()
 
-	if h.options.TSDBRetentionDuration != 0 {
-		status.StorageRetention = h.options.TSDBRetentionDuration.String()
+	h.mtx.RLock()
+	tsdbRetentionDuration := h.options.TSDBRetentionDuration
+	tsdbMaxBytes := h.options.TSDBMaxBytes
+	tsdbMaxPercentage := h.options.TSDBMaxPercentage
+	h.mtx.RUnlock()
+	if tsdbRetentionDuration != 0 {
+		status.StorageRetention = tsdbRetentionDuration.String()
 	}
-	if h.options.TSDBMaxBytes != 0 {
+	if tsdbMaxBytes != 0 {
 		if status.StorageRetention != "" {
 			status.StorageRetention += " or "
 		}
-		status.StorageRetention += h.options.TSDBMaxBytes.String()
+		status.StorageRetention += tsdbMaxBytes.String()
+	}
+	if tsdbMaxPercentage != 0 {
+		if status.StorageRetention != "" {
+			status.StorageRetention += " or "
+		}
+		status.StorageRetention = status.StorageRetention + strconv.FormatFloat(tsdbMaxPercentage, 'g', -1, 64) + "%"
 	}
 
 	metrics, err := h.gatherer.Gather()
@@ -902,10 +952,10 @@ func (h *Handler) quit(w http.ResponseWriter, _ *http.Request) {
 	h.quitOnce.Do(func() {
 		closed = true
 		close(h.quitCh)
-		fmt.Fprintf(w, "Requesting termination... Goodbye!")
+		fmt.Fprint(w, "Requesting termination... Goodbye!")
 	})
 	if !closed {
-		fmt.Fprintf(w, "Termination already in progress.")
+		fmt.Fprint(w, "Termination already in progress.")
 	}
 }
 
