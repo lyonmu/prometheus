@@ -35,3 +35,5 @@ npm_licenses.tar.bz2
 y.output
 .DS_Store
 .vscode
+
+.codegraph/
