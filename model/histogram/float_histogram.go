@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"strings"
 
 	"github.com/prometheus/prometheus/util/kahansum"
@@ -184,8 +185,8 @@ func (h *FloatHistogram) String() string {
 			nBuckets = append(nBuckets, it.At())
 		}
 	}
-	for i := len(nBuckets) - 1; i >= 0; i-- {
-		fmt.Fprintf(&sb, ", %s", nBuckets[i].String())
+	for _, v := range slices.Backward(nBuckets) {
+		fmt.Fprintf(&sb, ", %s", v.String())
 	}
 
 	if h.ZeroCount != 0 {
@@ -2350,32 +2351,14 @@ func handleInfinityBuckets(isUpperTrim bool, b Bucket[float64], rhs float64) (un
 }
 
 // computeSplit calculates the portion of the bucket's count <= rhs (trim point).
-func computeSplit(b Bucket[float64], rhs float64, isPositive, isLinear bool) float64 {
+func computeSplit(b Bucket[float64], rhs float64, isLinear bool) float64 {
 	if rhs <= b.Lower {
 		return 0
 	}
 	if rhs >= b.Upper {
 		return b.Count
 	}
-
-	var fraction float64
-	switch {
-	case isLinear:
-		fraction = (rhs - b.Lower) / (b.Upper - b.Lower)
-	default:
-		// Exponential interpolation.
-		logLower := math.Log2(math.Abs(b.Lower))
-		logUpper := math.Log2(math.Abs(b.Upper))
-		logV := math.Log2(math.Abs(rhs))
-
-		if isPositive {
-			fraction = (logV - logLower) / (logUpper - logLower)
-		} else {
-			fraction = 1 - ((logV - logUpper) / (logLower - logUpper))
-		}
-	}
-
-	return b.Count * fraction
+	return b.Count * b.FractionBelow(rhs, isLinear)
 }
 
 func computeZeroBucketTrim(zeroBucket Bucket[float64], rhs float64, hasNegative, hasPositive, isUpperTrim bool) (float64, float64) {
@@ -2422,7 +2405,7 @@ func computeBucketTrim(b Bucket[float64], rhs float64, isUpperTrim, isPositive, 
 		return handleInfinityBuckets(isUpperTrim, b, rhs)
 	}
 
-	underCount := computeSplit(b, rhs, isPositive, isCustomBucket)
+	underCount := computeSplit(b, rhs, isCustomBucket)
 
 	if isUpperTrim {
 		return underCount, computeMidpoint(b.Lower, rhs, isPositive, isCustomBucket)
